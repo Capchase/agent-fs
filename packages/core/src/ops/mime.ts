@@ -70,7 +70,14 @@ export function withUtf8Charset(contentType: string): string {
   const base = contentType.split(";")[0]?.trim() ?? "";
   if (!isIndexableMimeType(base)) return contentType;
   if (/;\s*charset=/i.test(contentType)) return contentType;
-  return `${base}; charset=utf-8`;
+  return `${contentType}; charset=utf-8`;
+}
+
+/** Encode a filename parameter for RFC 5987 Content-Disposition headers. */
+export function encodeRFC5987ValueChars(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
 }
 
 export function isIndexableMimeType(contentType: string): boolean {

@@ -7,7 +7,7 @@ import {
 } from "@/core";
 import type { DB, StorageAdapter, EmbeddingProvider } from "@/core";
 import { normalizePath } from "@/core/ops/paths.js";
-import { withUtf8Charset } from "@/core/ops/mime.js";
+import { encodeRFC5987ValueChars, withUtf8Charset } from "@/core/ops/mime.js";
 import type { AppEnv } from "../types.js";
 
 export function fileRoutes(
@@ -58,7 +58,7 @@ export function fileRoutes(
       const headers: Record<string, string> = {
         "Content-Type": contentType,
         "Content-Length": String(result.body.length),
-        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(
           filePath.split("/").pop() ?? "download"
         )}`,
         "Cache-Control": "private, max-age=60",

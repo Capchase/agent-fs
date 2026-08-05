@@ -221,12 +221,16 @@ export class MockS3Client implements StorageAdapter {
   async getPresignedUrl(
     key: string,
     expiresIn: number = 86400,
-    responseContentType?: string
+    responseContentType?: string,
+    responseContentDisposition?: string,
   ): Promise<string> {
     const ct = responseContentType
       ? `&ct=${encodeURIComponent(responseContentType)}`
       : "";
-    return `https://mock.local/${key}?e=${expiresIn}${ct}`;
+    const cd = responseContentDisposition
+      ? `&cd=${encodeURIComponent(responseContentDisposition)}`
+      : "";
+    return `https://mock.local/${key}?e=${expiresIn}${ct}${cd}`;
   }
 
   /** Reset all stored objects */

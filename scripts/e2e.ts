@@ -1493,6 +1493,26 @@ async function runStandardTests(daemonUrl: string) {
     assert(contentLength, Buffer.byteLength(buf), `Content-Length ${contentLength} does not match actual byte count ${Buffer.byteLength(buf)}`);
   });
 
+  if (localOnly) {
+    skipTest("presigned text download has charset and attachment headers", "requires a public MinIO presigned URL");
+  } else {
+    await test("presigned text download has charset and attachment headers", async () => {
+      const result = runJson("signed-url /charset-test.md");
+      const res = await fetch(result.url);
+      assert(res.ok, true, `Expected 200, got ${res.status}`);
+      assert(
+        res.headers.get("content-type"),
+        "text/markdown; charset=utf-8",
+        `Expected text response charset, got ${res.headers.get("content-type")}`,
+      );
+      assert(
+        res.headers.get("content-disposition"),
+        "attachment; filename*=UTF-8''charset-test.md",
+        `Expected attachment disposition, got ${res.headers.get("content-disposition")}`,
+      );
+    });
+  }
+
   // -- sql (DuckDB) --
 
   await test("sql fixtures: upload csv/tsv/ndjson/parquet/xlsx/sqlite", async () => {

@@ -84,4 +84,8 @@ describe("withUtf8Charset", () => {
     expect(withUtf8Charset("text/plain; charset=utf-8")).toBe("text/plain; charset=utf-8");
     expect(withUtf8Charset("text/plain;charset=UTF-8")).toBe("text/plain;charset=UTF-8");
   });
+
+  it("keeps non-charset MIME parameters", () => {
+    expect(withUtf8Charset("text/plain; format=flowed")).toBe("text/plain; format=flowed; charset=utf-8");
+  });
 });

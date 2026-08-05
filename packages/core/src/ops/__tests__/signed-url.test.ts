@@ -53,6 +53,20 @@ describe("signed-url op", () => {
 
     const ct = new URL(result.url).searchParams.get("ct");
     expect(ct).toBe("text/markdown; charset=utf-8");
+    const cd = new URL(result.url).searchParams.get("cd");
+    expect(cd).toBe("attachment; filename*=UTF-8''notes.md");
+  });
+
+  test("presigned URL RFC 5987-encodes its filename", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", { path: "/O'Reilly (draft)*.md", content: "# t" });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/O'Reilly (draft)*.md" })) as {
+      url: string;
+    };
+
+    expect(new URL(result.url).searchParams.get("cd"))
+      .toBe("attachment; filename*=UTF-8''O%27Reilly%20%28draft%29%2A.md");
   });
 
   test("presigned URL for a binary file has no charset", async () => {

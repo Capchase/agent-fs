@@ -115,5 +115,6 @@ export interface StorageAdapter {
     key: string,
     expiresIn?: number,
     responseContentType?: string,
+    responseContentDisposition?: string,
   ): Promise<string>;
 }
