@@ -7,6 +7,7 @@ import {
 } from "@/core";
 import type { DB, StorageAdapter, EmbeddingProvider } from "@/core";
 import { normalizePath } from "@/core/ops/paths.js";
+import { withUtf8Charset } from "@/core/ops/mime.js";
 import type { AppEnv } from "../types.js";
 
 export function fileRoutes(
@@ -43,7 +44,9 @@ export function fileRoutes(
 
     try {
       const result = await s3.getObject(key);
-      const contentType = result.contentType || "application/octet-stream";
+      const contentType = withUtf8Charset(
+        result.contentType || "application/octet-stream"
+      );
 
       // Look up the head version row so the response carries the version
       // and content hash without a second round-trip from the client.
@@ -55,6 +58,9 @@ export function fileRoutes(
       const headers: Record<string, string> = {
         "Content-Type": contentType,
         "Content-Length": String(result.body.length),
+        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(
+          filePath.split("/").pop() ?? "download"
+        )}`,
         "Cache-Control": "private, max-age=60",
       };
 

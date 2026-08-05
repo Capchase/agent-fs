@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
-import { getOpDefinition } from "../index.js";
+import { getOpDefinition, dispatchOp } from "../index.js";
+import { createTestContext } from "../../test-utils.js";
 
 describe("signed-url op", () => {
   const opDef = getOpDefinition("signed-url")!;
@@ -40,5 +41,32 @@ describe("signed-url op", () => {
   test("schema accepts boundary values", () => {
     expect(opDef.schema.parse({ path: "/f", expiresIn: 60 })).toEqual({ path: "/f", expiresIn: 60 });
     expect(opDef.schema.parse({ path: "/f", expiresIn: 604800 })).toEqual({ path: "/f", expiresIn: 604800 });
+  });
+
+  test("presigned URL carries a charset for a text file", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", { path: "/notes.md", content: "# t — em dash" });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/notes.md" })) as {
+      url: string;
+    };
+
+    const ct = new URL(result.url).searchParams.get("ct");
+    expect(ct).toBe("text/markdown; charset=utf-8");
+  });
+
+  test("presigned URL for a binary file has no charset", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", {
+      path: "/logo.png",
+      content: "not really png bytes",
+    });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/logo.png" })) as {
+      url: string;
+    };
+
+    const ct = new URL(result.url).searchParams.get("ct");
+    expect(ct).toBe("image/png");
   });
 });

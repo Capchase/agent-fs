@@ -58,6 +58,21 @@ export function detectMimeType(path: string): string {
   return MIME_MAP[ext] ?? "application/octet-stream";
 }
 
+/**
+ * Add `charset=utf-8` to a text-family content type for HTTP delivery.
+ *
+ * `detectMimeType` stays a bare type because it is also stored as object and DB
+ * metadata. Only the HTTP boundaries need the charset: a text response with no
+ * charset lets the client fall back to its locale default (cp1252 on Windows),
+ * which mojibakes every multibyte character.
+ */
+export function withUtf8Charset(contentType: string): string {
+  const base = contentType.split(";")[0]?.trim() ?? "";
+  if (!isIndexableMimeType(base)) return contentType;
+  if (/;\s*charset=/i.test(contentType)) return contentType;
+  return `${base}; charset=utf-8`;
+}
+
 export function isIndexableMimeType(contentType: string): boolean {
   const normalized = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
   return (
