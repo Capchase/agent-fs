@@ -18,6 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # Catches a partial version bump (root package.json moved but the
+      # sub-packages, Cargo.toml, or plugin.json were left behind) on the PR
+      # rather than at release time.
+      - name: Version sync
+        run: bun run scripts/sync-versions.ts --check
       - name: Typecheck
         run: bun run typecheck
       - name: Build

@@ -1,0 +1,77 @@
+name: Auto Release
+
+# A version bump landing on main IS the release trigger.
+#
+# This job verifies every version target moved together, then tags and hands
+# off to the existing publish workflows. It is idempotent: the release is keyed
+# on "does the tag for the current root package.json version exist yet", so a
+# rerun after a failure resumes rather than duplicates, and a bump that somehow
+# reached main untagged gets picked up on the next push.
+#
+# Why the explicit dispatch below: a tag pushed with GITHUB_TOKEN does NOT
+# trigger `on: push: tags` workflows — GitHub blocks recursive workflow runs
+# from the default token. So npm-publish and docker-publish are invoked via
+# workflow_dispatch instead of relying on the tag push.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  auto-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the tag
+      actions: write # dispatch the publish workflows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history + tags to test tag existence
+
+      - uses: oven-sh/setup-bun@v2
+
+      # Hard gate: a partial bump (root moved, sub-packages/Cargo.toml/plugin
+      # left behind) fails here instead of shipping a broken version set.
+      - name: Verify every version target moved together
+        run: bun run scripts/sync-versions.ts --check
+
+      - name: Decide whether a release is needed
+        id: state
+        run: |
+          VERSION="$(jq -r .version package.json)"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${TAG} is already tagged — nothing to release."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${TAG} is not tagged yet — releasing ${VERSION}."
+          fi
+
+      - name: Create and push tag
+        if: steps.state.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.state.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Dispatch publish workflows
+        if: steps.state.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.state.outputs.tag }}
+        run: |
+          gh workflow run npm-publish.yml    --ref main -f tag="$TAG"
+          gh workflow run docker-publish.yml --ref main -f tag="$TAG"
+          echo "::notice::Dispatched npm-publish and docker-publish for ${TAG}."

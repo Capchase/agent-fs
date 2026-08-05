@@ -3,6 +3,12 @@ name: Publish Docker Image
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build (e.g. v0.12.2)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,8 +18,14 @@ permissions:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    env:
+      # On a tag push this is the tag itself; on workflow_dispatch (used by
+      # auto-release.yml) github.ref_name is "main", so the input carries the tag.
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: docker/setup-qemu-action@v3
 
@@ -29,10 +41,14 @@ jobs:
         id: meta
         with:
           images: ghcr.io/desplega-ai/agent-fs
+          # `value=` pins the semver source to RELEASE_TAG. Without it these
+          # patterns read github.ref, which is "refs/heads/main" under
+          # workflow_dispatch and would parse as a non-semver ref (no version
+          # tags emitted at all).
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 

@@ -20,6 +20,12 @@
 //   - .claude-plugin/plugin.json
 //
 // --dry-run prints the would-be changes without writing.
+//
+// --check takes no <new-version>. It verifies every target above already
+// matches the root package.json version and exits non-zero on drift. CI runs
+// this on every PR so a partial bump (root only, sub-packages forgotten) fails
+// before it reaches main, and the auto-release workflow runs it as a gate
+// before tagging.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -30,12 +36,171 @@ const repoRoot = resolve(__dirname, "..");
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
+const check = args.includes("--check");
 const positional = args.filter((a) => !a.startsWith("--"));
+
+// Every package.json that must carry the release version. The root is the
+// source of truth; these follow it.
+const subpackages = [
+  "packages/cli/package.json",
+  "packages/core/package.json",
+  "packages/server/package.json",
+  "packages/mcp/package.json",
+  "packages/just-bash/package.json",
+  "packages/fuse-helper-linux-x64/package.json",
+  "packages/fuse-helper-linux-arm64/package.json",
+];
+
+// optionalDependencies on the CLI that are published in lockstep and pinned to
+// a caret range of the release version.
+const FUSE_OPT_DEP_PREFIX = "@desplega.ai/agent-fs-fuse-";
+
+function readJson(relPath: string): Record<string, unknown> | null {
+  const abs = resolve(repoRoot, relPath);
+  if (!existsSync(abs)) return null;
+  return JSON.parse(readFileSync(abs, "utf-8")) as Record<string, unknown>;
+}
+
+function readCargoPackageVersion(relPath: string): string | null {
+  const abs = resolve(repoRoot, relPath);
+  if (!existsSync(abs)) return null;
+  let inPackage = false;
+  for (const line of readFileSync(abs, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      inPackage = trimmed === "[package]";
+      continue;
+    }
+    if (inPackage) {
+      const m = /^\s*version\s*=\s*"([^"]*)"/.exec(line);
+      if (m) return m[1] as string;
+    }
+  }
+  return null;
+}
+
+// Cargo.lock carries the workspace member's version too. cargo would rewrite it
+// on the next build, but a committed lockfile disagreeing with Cargo.toml is
+// drift like any other — it sat at 0.8.0 through four releases before --check
+// existed to catch it.
+//
+// Pass `replacement: null` to read the current value without rewriting.
+function mapCargoLockVersion(
+  raw: string,
+  crate: string,
+  replacement: string | null
+): { version: string | null; text: string } {
+  const lines = raw.split("\n");
+  let inTarget = false;
+  let found: string | null = null;
+  const out = lines.map((line) => {
+    const trimmed = line.trim();
+    if (trimmed === "[[package]]") {
+      inTarget = false;
+      return line;
+    }
+    if (trimmed === `name = "${crate}"`) {
+      inTarget = true;
+      return line;
+    }
+    if (inTarget && found === null) {
+      const m = /^(\s*version\s*=\s*)"([^"]*)"(.*)$/.exec(line);
+      if (m) {
+        found = m[2] as string;
+        if (replacement !== null) return `${m[1]}"${replacement}"${m[3]}`;
+      }
+    }
+    return line;
+  });
+  return { version: found, text: out.join("\n") };
+}
+
+const FUSE_CRATE = "agent-fs-fuse";
+const CARGO_LOCK = "Cargo.lock";
+
+function readCargoLockVersion(relPath: string): string | null {
+  const abs = resolve(repoRoot, relPath);
+  if (!existsSync(abs)) return null;
+  return mapCargoLockVersion(readFileSync(abs, "utf-8"), FUSE_CRATE, null).version;
+}
+
+// --check ---------------------------------------------------------------
+// Compares the version *fields* rather than whole-file bytes, so reformatting
+// a package.json can never trip the gate — only a real version mismatch does.
+if (check) {
+  const rootPkg = readJson("package.json");
+  if (!rootPkg) {
+    console.error("Cannot read root package.json");
+    process.exit(1);
+  }
+  const expected = String(rootPkg.version);
+  const problems: string[] = [];
+
+  for (const rel of subpackages) {
+    const pkg = readJson(rel);
+    if (!pkg) {
+      problems.push(`${rel} — file not found`);
+      continue;
+    }
+    const found = pkg.version as string | undefined;
+    if (found !== expected) problems.push(`${rel} — ${found} (expected ${expected})`);
+  }
+
+  const cli = readJson("packages/cli/package.json");
+  const optDeps = (cli?.optionalDependencies ?? {}) as Record<string, string>;
+  for (const [name, range] of Object.entries(optDeps)) {
+    if (!name.startsWith(FUSE_OPT_DEP_PREFIX)) continue;
+    if (range !== `^${expected}`) {
+      problems.push(
+        `packages/cli/package.json optionalDependencies["${name}"] — ${range} (expected ^${expected})`
+      );
+    }
+  }
+
+  const cargoVersion = readCargoPackageVersion("packages/fuse-helper/Cargo.toml");
+  if (cargoVersion === null) {
+    problems.push("packages/fuse-helper/Cargo.toml — no [package] version found");
+  } else if (cargoVersion !== expected) {
+    problems.push(
+      `packages/fuse-helper/Cargo.toml — ${cargoVersion} (expected ${expected})`
+    );
+  }
+
+  const lockVersion = readCargoLockVersion(CARGO_LOCK);
+  if (lockVersion === null) {
+    problems.push(`${CARGO_LOCK} — no ${FUSE_CRATE} package entry found`);
+  } else if (lockVersion !== expected) {
+    problems.push(`${CARGO_LOCK} — ${lockVersion} (expected ${expected})`);
+  }
+
+  const plugin = readJson(".claude-plugin/plugin.json");
+  if (!plugin) {
+    problems.push(".claude-plugin/plugin.json — file not found");
+  } else if (plugin.version !== expected) {
+    problems.push(
+      `.claude-plugin/plugin.json — ${plugin.version} (expected ${expected})`
+    );
+  }
+
+  if (problems.length > 0) {
+    console.error(`Version drift — root package.json is ${expected}, but:\n`);
+    for (const p of problems) console.error(`  ✗ ${p}`);
+    console.error(
+      `\nFix with:  bun run scripts/sync-versions.ts ${expected}\nthen commit the result.`
+    );
+    process.exit(1);
+  }
+
+  console.log(`✓ every version target is at ${expected}.`);
+  process.exit(0);
+}
+
 const newVersion = positional[0];
 
 if (!newVersion) {
   console.error(
-    "Usage: bun run scripts/sync-versions.ts <new-version> [--dry-run]"
+    "Usage: bun run scripts/sync-versions.ts <new-version> [--dry-run]\n" +
+      "       bun run scripts/sync-versions.ts --check"
   );
   process.exit(1);
 }
@@ -129,15 +294,6 @@ rewriteJson("package.json", (pkg) => {
   pkg.version = newVersion;
 });
 
-const subpackages = [
-  "packages/cli/package.json",
-  "packages/core/package.json",
-  "packages/server/package.json",
-  "packages/mcp/package.json",
-  "packages/just-bash/package.json",
-  "packages/fuse-helper-linux-x64/package.json",
-  "packages/fuse-helper-linux-arm64/package.json",
-];
 for (const sub of subpackages) {
   rewriteJson(sub, (pkg) => {
     pkg.version = newVersion;
@@ -155,7 +311,7 @@ rewriteJson("packages/cli/package.json", (pkg) => {
     | undefined;
   if (!optDeps) return;
   for (const name of Object.keys(optDeps)) {
-    if (name.startsWith("@desplega.ai/agent-fs-fuse-")) {
+    if (name.startsWith(FUSE_OPT_DEP_PREFIX)) {
       optDeps[name] = `^${newVersion}`;
     }
   }
@@ -163,6 +319,22 @@ rewriteJson("packages/cli/package.json", (pkg) => {
 
 // Cargo.toml ------------------------------------------------------------
 rewriteCargoToml("packages/fuse-helper/Cargo.toml");
+
+// Cargo.lock ------------------------------------------------------------
+{
+  const abs = resolve(repoRoot, CARGO_LOCK);
+  if (!existsSync(abs)) {
+    console.warn(`[skip] ${CARGO_LOCK} — not found`);
+  } else {
+    const raw = readFileSync(abs, "utf-8");
+    const { version, text } = mapCargoLockVersion(raw, FUSE_CRATE, newVersion);
+    if (version === null) {
+      console.warn(`[warn] ${CARGO_LOCK} — no ${FUSE_CRATE} package entry found`);
+    } else if (recordIfDifferent(CARGO_LOCK, raw, text)) {
+      if (!dryRun) writeFileSync(abs, text);
+    }
+  }
+}
 
 // Plugin metadata -------------------------------------------------------
 rewriteJson(".claude-plugin/plugin.json", (plugin) => {

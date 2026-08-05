@@ -7,15 +7,32 @@
 
 ## Release Process
 
-1. Update `version` in root `package.json`
-2. Commit the version bump
-3. Run `./scripts/release.sh`
+Releases are **automatic**: a version change landing on `main` is the trigger. There is no manual tagging step.
 
-This creates a git tag `v{version}` and pushes it, triggering the release workflow which:
+```bash
+./scripts/release.sh 0.13.0
+```
 
-- **Runs typecheck and tests** to validate the release
-- **Publishes to npm** as `@desplega.ai/agent-fs`, `@desplega.ai/agent-fs-just-bash`, and the FUSE helper sub-packages with provenance
-- **Creates a GitHub Release** with install instructions
+That syncs every version target, commits, and pushes. On a branch it stops there (open a PR); on `main` — or as soon as the PR merges — `.github/workflows/auto-release.yml` runs:
+
+1. **Verifies version sync** (`sync-versions.ts --check`) and fails the release on any drift
+2. **Tags** `v{version}`, unless that tag already exists
+3. **Dispatches the publish workflows**, which run typecheck + build + tests, publish `@desplega.ai/agent-fs`, `@desplega.ai/agent-fs-just-bash`, and the FUSE sub-packages to npm with provenance, create the GitHub Release, and push the multi-arch GHCR image
+
+The release is keyed on tag existence rather than on a diff between pushes, so it is idempotent — a rerun after a failure resumes instead of duplicating, and every publish step independently skips versions already on the registry.
+
+> A tag pushed with `GITHUB_TOKEN` does **not** fire `on: push: tags` workflows (GitHub blocks recursive runs from the default token). That is why `auto-release.yml` invokes `npm-publish.yml` and `docker-publish.yml` through `workflow_dispatch` rather than relying on the tag push. Both still accept a plain tag push, so a manually pushed tag works as before.
+
+### Version sync
+
+`scripts/sync-versions.ts` is the single source of truth for the release version. It owns:
+
+- root `package.json` + the 7 sub-package manifests
+- `optionalDependencies` pins on the CLI for the FUSE sub-packages (`^{version}`)
+- `packages/fuse-helper/Cargo.toml` and the `agent-fs-fuse` entry in `Cargo.lock`
+- `.claude-plugin/plugin.json`
+
+`bun run scripts/sync-versions.ts --check` verifies all of them match the root version and exits non-zero on drift. It runs in CI on every PR, so a partial bump fails review rather than shipping a mismatched version set.
 
 ## npm Package
 
