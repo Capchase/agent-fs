@@ -3,7 +3,7 @@ import { getS3Key } from "./versioning.js";
 import { buildAppUrl } from "./urls.js";
 import { normalizePath } from "./paths.js";
 import { NotFoundError, UnsupportedOperation } from "../errors.js";
-import { detectMimeType } from "./mime.js";
+import { detectMimeType, encodeRFC5987ValueChars, withUtf8Charset } from "./mime.js";
 
 export interface SignedUrlParams {
   path: string;
@@ -65,11 +65,13 @@ export async function signedUrl(
     };
   }
 
-  const contentType = detectMimeType(normalizedPath);
+  const contentType = withUtf8Charset(detectMimeType(normalizedPath));
+  const filename = normalizedPath.split("/").pop() ?? "download";
   const url = await ctx.s3.getPresignedUrl(
     key,
     expiresIn,
     contentType !== "application/octet-stream" ? contentType : undefined,
+    `attachment; filename*=UTF-8''${encodeRFC5987ValueChars(filename)}`,
   );
 
   return {

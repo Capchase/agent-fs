@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
-import { getOpDefinition } from "../index.js";
+import { getOpDefinition, dispatchOp } from "../index.js";
+import { createTestContext } from "../../test-utils.js";
 
 describe("signed-url op", () => {
   const opDef = getOpDefinition("signed-url")!;
@@ -40,5 +41,46 @@ describe("signed-url op", () => {
   test("schema accepts boundary values", () => {
     expect(opDef.schema.parse({ path: "/f", expiresIn: 60 })).toEqual({ path: "/f", expiresIn: 60 });
     expect(opDef.schema.parse({ path: "/f", expiresIn: 604800 })).toEqual({ path: "/f", expiresIn: 604800 });
+  });
+
+  test("presigned URL carries a charset for a text file", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", { path: "/notes.md", content: "# t — em dash" });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/notes.md" })) as {
+      url: string;
+    };
+
+    const ct = new URL(result.url).searchParams.get("ct");
+    expect(ct).toBe("text/markdown; charset=utf-8");
+    const cd = new URL(result.url).searchParams.get("cd");
+    expect(cd).toBe("attachment; filename*=UTF-8''notes.md");
+  });
+
+  test("presigned URL RFC 5987-encodes its filename", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", { path: "/O'Reilly (draft)*.md", content: "# t" });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/O'Reilly (draft)*.md" })) as {
+      url: string;
+    };
+
+    expect(new URL(result.url).searchParams.get("cd"))
+      .toBe("attachment; filename*=UTF-8''O%27Reilly%20%28draft%29%2A.md");
+  });
+
+  test("presigned URL for a binary file has no charset", async () => {
+    const { ctx } = createTestContext();
+    await dispatchOp(ctx, "write", {
+      path: "/logo.png",
+      content: "not really png bytes",
+    });
+
+    const result = (await dispatchOp(ctx, "signed-url", { path: "/logo.png" })) as {
+      url: string;
+    };
+
+    const ct = new URL(result.url).searchParams.get("ct");
+    expect(ct).toBe("image/png");
   });
 });

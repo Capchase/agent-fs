@@ -1458,6 +1458,61 @@ async function runStandardTests(daemonUrl: string) {
     });
   }
 
+  // Daemon /raw route must declare a charset on text responses, or the
+  // browser's anchor-download path falls back to a locale default (cp1252 on
+  // Windows) and mojibakes every multibyte character. Assert bytes, not
+  // strings — a string comparison in a UTF-8 test file passes even when the
+  // transport corrupts the bytes.
+  await test("GET /raw declares charset=utf-8 and preserves UTF-8 bytes", async () => {
+    const writeRes = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        op: "write",
+        path: "/charset-test.md",
+        content: "# t — em dash",
+      }),
+    });
+    assert(writeRes.ok, true, `Seed write failed: ${writeRes.status}`);
+
+    const rawUrl = `${daemonUrl}/orgs/${personalOrgId}/drives/${personalDriveId}/files/charset-test.md/raw`;
+    const res = await fetch(rawUrl, { headers: { "Authorization": `Bearer ${apiKey}` } });
+    assert(res.ok, true, `Expected 200, got ${res.status}`);
+
+    const ct = res.headers.get("content-type");
+    assert(ct, "text/markdown; charset=utf-8", `Expected charset in Content-Type, got ${ct}`);
+
+    const buf = Buffer.from(await res.arrayBuffer());
+    assert(buf.includes(Buffer.from([0xe2, 0x80, 0x94])), true, "Expected correct UTF-8 em dash bytes (e2 80 94)");
+    assert(buf.includes(Buffer.from([0xc3, 0xa2, 0xe2, 0x82, 0xac])), false, "Found double-encoded em dash bytes — mojibake regression");
+
+    const contentLength = Number(res.headers.get("content-length"));
+    assert(contentLength, Buffer.byteLength(buf), `Content-Length ${contentLength} does not match actual byte count ${Buffer.byteLength(buf)}`);
+  });
+
+  if (localOnly) {
+    skipTest("presigned text download has charset and attachment headers", "requires a public MinIO presigned URL");
+  } else {
+    await test("presigned text download has charset and attachment headers", async () => {
+      const result = runJson("signed-url /charset-test.md");
+      const res = await fetch(result.url);
+      assert(res.ok, true, `Expected 200, got ${res.status}`);
+      assert(
+        res.headers.get("content-type"),
+        "text/markdown; charset=utf-8",
+        `Expected text response charset, got ${res.headers.get("content-type")}`,
+      );
+      assert(
+        res.headers.get("content-disposition"),
+        "attachment; filename*=UTF-8''charset-test.md",
+        `Expected attachment disposition, got ${res.headers.get("content-disposition")}`,
+      );
+    });
+  }
+
   // -- sql (DuckDB) --
 
   await test("sql fixtures: upload csv/tsv/ndjson/parquet/xlsx/sqlite", async () => {

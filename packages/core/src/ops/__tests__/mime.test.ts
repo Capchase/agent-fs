@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { detectMimeType } from "../mime.js";
+import { detectMimeType, withUtf8Charset } from "../mime.js";
 
 describe("detectMimeType", () => {
   // Standard extensions
@@ -64,5 +64,28 @@ describe("detectMimeType", () => {
     expect(detectMimeType("")).toBe("application/octet-stream");
     expect(detectMimeType(".")).toBe("application/octet-stream");
     expect(detectMimeType("..")).toBe("application/octet-stream");
+  });
+});
+
+describe("withUtf8Charset", () => {
+  it("appends charset to text-family types", () => {
+    expect(withUtf8Charset("text/markdown")).toBe("text/markdown; charset=utf-8");
+    expect(withUtf8Charset("application/json")).toBe("application/json; charset=utf-8");
+    expect(withUtf8Charset("image/svg+xml")).toBe("image/svg+xml; charset=utf-8");
+  });
+
+  it("leaves binary types unchanged", () => {
+    expect(withUtf8Charset("image/png")).toBe("image/png");
+    expect(withUtf8Charset("application/octet-stream")).toBe("application/octet-stream");
+    expect(withUtf8Charset("application/pdf")).toBe("application/pdf");
+  });
+
+  it("does not double-append when a charset is already present", () => {
+    expect(withUtf8Charset("text/plain; charset=utf-8")).toBe("text/plain; charset=utf-8");
+    expect(withUtf8Charset("text/plain;charset=UTF-8")).toBe("text/plain;charset=UTF-8");
+  });
+
+  it("keeps non-charset MIME parameters", () => {
+    expect(withUtf8Charset("text/plain; format=flowed")).toBe("text/plain; format=flowed; charset=utf-8");
   });
 });

@@ -216,11 +216,13 @@ export class AgentS3Client implements StorageAdapter {
     key: string,
     expiresIn: number = 86400,
     responseContentType?: string,
+    responseContentDisposition?: string,
   ): Promise<string> {
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
       ...(responseContentType && { ResponseContentType: responseContentType }),
+      ...(responseContentDisposition && { ResponseContentDisposition: responseContentDisposition }),
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- AWS SDK type mismatch between client-s3 and s3-request-presigner
     return getSignedUrl(this.presignClient as any, command, { expiresIn });
