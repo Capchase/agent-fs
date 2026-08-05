@@ -15,34 +15,25 @@ Bun monorepo: `packages/{core, cli, mcp, server}`
 
 ## Releasing & Deployment
 
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for full deployment details (npm publishing, secrets, install methods).
+**[RELEASING.md](./RELEASING.md) is the source of truth for the release process** — read it before touching versions, release scripts, or the publish workflows. Do not restate its mechanics elsewhere; link to it.
 
-## Release Steps
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for deployment targets (npm package contents, Docker/GHCR, Fly.io, env vars).
 
-**Releases are automatic.** A version change landing on `main` is the trigger — there is no manual tagging step.
+Short version: releases are automatic. A version change landing on `main` triggers tag + publish.
 
 ```bash
 ./scripts/release.sh 0.13.0   # sync every version target, commit, push
 ```
 
-On a branch this just pushes the bump; open a PR and the release fires when it merges. Run it on `main` (or merge the bump) and `.github/workflows/auto-release.yml` takes over:
-
-1. Runs `sync-versions.ts --check` — **fails the release** if any version target drifted
-2. Tags `v{version}` if that tag doesn't exist yet
-3. Dispatches `npm-publish.yml` (typecheck + build + test, then npm with provenance + GitHub Release) and `docker-publish.yml` (multi-arch GHCR image)
-
-It is keyed on "does the tag for the current root version exist", so it is idempotent — reruns resume rather than duplicate, and a bump that reaches `main` untagged is picked up on the next push.
-
-Never bump the version by hand-editing `package.json` alone. `sync-versions.ts` owns all 12 targets (7 sub-package manifests, the CLI's `optionalDependencies` pins, `Cargo.toml`, `Cargo.lock`, `.claude-plugin/plugin.json`); CI rejects a partial bump on the PR.
+Never bump a version by hand-editing `package.json` — `scripts/sync-versions.ts` owns every place the version appears, and CI fails a partial bump.
 
 ## Release Checklist (applies to plans, research, and Plan mode)
 
 When making changes to core ops, CLI commands, or MCP tools, always check:
 
 1. **Skill update** — If a new op/command was added or existing behavior changed, update `skills/agent-fs/SKILL.md` (command tables, description triggers, workflow examples).
-2. **Plugin version bump** — Handled by `sync-versions.ts`; never edit `.claude-plugin/plugin.json` by hand.
-3. **Package version bump** — Run `./scripts/release.sh <version>` (patch for fixes/features, minor for breaking changes). This bumps every target at once and, once merged to `main`, publishes automatically.
-4. **E2E coverage** — If a new op was added, add corresponding tests to `scripts/e2e.ts`.
+2. **E2E coverage** — If a new op was added, add corresponding tests to `scripts/e2e.ts`.
+3. **Version bump** — Run `./scripts/release.sh <version>` (patch for fixes/features, minor for breaking changes). This bumps every target at once — including `.claude-plugin/plugin.json`, which must never be edited by hand — and publishes automatically once it reaches `main`.
 
 Plans and research documents MUST include these as explicit steps when they involve core/CLI/MCP changes.
 

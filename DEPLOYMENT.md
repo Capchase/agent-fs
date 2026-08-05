@@ -1,38 +1,16 @@
 # Deployment
 
-## Prerequisites
-
-- `NPM_TOKEN` secret set in GitHub repo settings (granular access token for `@desplega-ai` scope)
-- `@desplega-ai` org exists on npm
+This file covers **what gets deployed and where**. For how a release is cut, tagged, and published — plus recovery when a publish fails — see **[RELEASING.md](./RELEASING.md)**.
 
 ## Release Process
 
-Releases are **automatic**: a version change landing on `main` is the trigger. There is no manual tagging step.
+Releases are automatic: a version change landing on `main` tags and publishes.
 
 ```bash
 ./scripts/release.sh 0.13.0
 ```
 
-That syncs every version target, commits, and pushes. On a branch it stops there (open a PR); on `main` — or as soon as the PR merges — `.github/workflows/auto-release.yml` runs:
-
-1. **Verifies version sync** (`sync-versions.ts --check`) and fails the release on any drift
-2. **Tags** `v{version}`, unless that tag already exists
-3. **Dispatches the publish workflows**, which run typecheck + build + tests, publish `@desplega.ai/agent-fs`, `@desplega.ai/agent-fs-just-bash`, and the FUSE sub-packages to npm with provenance, create the GitHub Release, and push the multi-arch GHCR image
-
-The release is keyed on tag existence rather than on a diff between pushes, so it is idempotent — a rerun after a failure resumes instead of duplicating, and every publish step independently skips versions already on the registry.
-
-> A tag pushed with `GITHUB_TOKEN` does **not** fire `on: push: tags` workflows (GitHub blocks recursive runs from the default token). That is why `auto-release.yml` invokes `npm-publish.yml` and `docker-publish.yml` through `workflow_dispatch` rather than relying on the tag push. Both still accept a plain tag push, so a manually pushed tag works as before.
-
-### Version sync
-
-`scripts/sync-versions.ts` is the single source of truth for the release version. It owns:
-
-- root `package.json` + the 7 sub-package manifests
-- `optionalDependencies` pins on the CLI for the FUSE sub-packages (`^{version}`)
-- `packages/fuse-helper/Cargo.toml` and the `agent-fs-fuse` entry in `Cargo.lock`
-- `.claude-plugin/plugin.json`
-
-`bun run scripts/sync-versions.ts --check` verifies all of them match the root version and exits non-zero on drift. It runs in CI on every PR, so a partial bump fails review rather than shipping a mismatched version set.
+Full process, version-sync rules, and recovery steps: **[RELEASING.md](./RELEASING.md)**.
 
 ## npm Package
 
@@ -60,21 +38,9 @@ agent-fs --help
 |---------|-------------|
 | `bun run build` | Bundle CLI for npm to `packages/cli/dist/cli.js` |
 
-## Manual npm Publish (if needed)
+## Manual npm Publish
 
-```bash
-bun run build
-cd packages/just-bash && bun run build && bun publish --access public
-cd packages/cli && bun publish --access public
-```
-
-Requires `NPM_CONFIG_TOKEN` env var set with a valid npm token.
-
-## Notes
-
-- `bun publish` auto-resolves `workspace:*` dependencies to real versions
-- Auth uses `NPM_CONFIG_TOKEN` (not `NODE_AUTH_TOKEN` — Bun ignores that)
-- No `--provenance` support in `bun publish` yet; use `npm publish` if needed
+A last resort for when GitHub Actions itself is broken — see [Publishing from a laptop](./RELEASING.md#publishing-from-a-laptop) in RELEASING.md.
 
 ## Docker / GHCR
 

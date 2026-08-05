@@ -146,11 +146,13 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full development guide.
 
 ## Releasing
 
-1. Update `version` in root `package.json`
-2. Commit the version bump
-3. Run `./scripts/release.sh`
+Releases are automatic — a version change landing on `main` tags and publishes.
 
-This creates a git tag and pushes it, triggering the release workflow which publishes to npm and creates a GitHub Release.
+```bash
+./scripts/release.sh 0.13.0
+```
+
+See [RELEASING.md](./RELEASING.md) for the full process, version-sync rules, and recovery steps.
 
 ## Deploy to Fly.io
 

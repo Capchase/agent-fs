@@ -8,6 +8,8 @@ Thanks for your interest in contributing to Agent FS!
 - [Running the Project](#running-the-project)
 - [Code Quality](#code-quality)
 - [Project Structure](#project-structure)
+- [Submitting Changes](#submitting-changes)
+- [Releasing](#releasing)
 
 ---
 
@@ -86,5 +88,21 @@ agent-fs/
 3. Make your changes
 4. Run `bun run typecheck` and `bun run test`
 5. Open a PR
+
+Don't bump the version in your PR unless you're cutting a release — see below.
+
+---
+
+## Releasing
+
+Maintainers only. Releases are automatic: a version change landing on `main` tags and publishes.
+
+```bash
+./scripts/release.sh 0.13.0
+```
+
+Never hand-edit a version in `package.json` — `scripts/sync-versions.ts` owns every place it appears, and CI fails a partial bump. Full process in [RELEASING.md](./RELEASING.md).
+
+---
 
 Join our [Discord](https://discord.gg/KZgfyyDVZa) if you have questions or want to discuss ideas.
