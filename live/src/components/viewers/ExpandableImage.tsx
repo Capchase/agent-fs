@@ -13,6 +13,7 @@ interface ExpandableImageProps {
   src: string
   alt?: string
   title?: string
+  onError?: () => void
 }
 
 function inferFilename(src: string, alt?: string): string {
@@ -26,7 +27,7 @@ function inferFilename(src: string, alt?: string): string {
   return alt?.trim() || "image"
 }
 
-export function ExpandableImage({ src, alt, title }: ExpandableImageProps) {
+export function ExpandableImage({ src, alt, title, onError }: ExpandableImageProps) {
   const [open, setOpen] = useState(false)
   const filename = inferFilename(src, alt)
 
@@ -43,6 +44,7 @@ export function ExpandableImage({ src, alt, title }: ExpandableImageProps) {
           title={title}
           className="max-w-full cursor-zoom-in rounded-md"
           onClick={() => setOpen(true)}
+          onError={onError}
         />
         <span className="pointer-events-none absolute right-2 top-2 flex gap-1 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
           <Tooltip>
