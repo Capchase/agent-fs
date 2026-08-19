@@ -35,7 +35,7 @@ export function resolveImageSrc(
         kind: "drive",
         orgId: match[1],
         driveId: match[2],
-        path: decodeURIComponent(match[3]),
+        path: safeDecodeURIComponent(match[3]),
       }
     }
     return { kind: "external", url: src }
@@ -58,6 +58,15 @@ function tryParseAbsoluteUrl(src: string): URL | null {
     return new URL(src)
   } catch {
     return null
+  }
+}
+
+/** A malformed percent escape (e.g. `%zz`) must not crash rendering — fall back to the raw segment. */
+function safeDecodeURIComponent(segment: string): string {
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
   }
 }
 

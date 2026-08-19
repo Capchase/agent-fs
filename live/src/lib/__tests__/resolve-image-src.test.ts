@@ -75,6 +75,17 @@ describe("resolveImageSrc", () => {
     expect(resolveImageSrc(src, DOC_PATH, ROUTE_ORG, ROUTE_DRIVE)).toEqual({ kind: "external", url: src })
   })
 
+  test("malformed percent escape in path falls back to the raw segment instead of throwing", () => {
+    const src = `https://live.agent-fs.dev/file/~/${ROUTE_ORG}/${ROUTE_DRIVE}/a%zzb/c.png`
+    expect(() => resolveImageSrc(src, DOC_PATH, ROUTE_ORG, ROUTE_DRIVE)).not.toThrow()
+    expect(resolveImageSrc(src, DOC_PATH, ROUTE_ORG, ROUTE_DRIVE)).toEqual({
+      kind: "drive",
+      orgId: ROUTE_ORG,
+      driveId: ROUTE_DRIVE,
+      path: "a%zzb/c.png",
+    })
+  })
+
   test("uppercase-hex UUID still resolves to drive", () => {
     const org = ROUTE_ORG.toUpperCase()
     const drive = ROUTE_DRIVE.toUpperCase()
