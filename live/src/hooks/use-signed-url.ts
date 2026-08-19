@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react"
 import { useAuth } from "@/contexts/auth"
 import type { AgentFsClient } from "@/api/client"
+import { driveImageCache, type DriveImageResolution, type DriveImageCacheEntry } from "@/lib/drive-image-cache"
 
 export function useSignedUrl(path: string | null) {
   const { client, orgId, driveId } = useAuth()
@@ -36,26 +37,7 @@ export function useSignedUrl(path: string | null) {
   return { url, error, isLoading }
 }
 
-export interface DriveImageResolution {
-  orgId: string
-  driveId: string
-  path: string
-}
-
-interface DriveImageCacheEntry {
-  url: string
-  /** Epoch ms; `Infinity` for a `kind: "app"`-free, non-expiring entry. */
-  expiresAt: number
-}
-
-// Keyed by "org/drive/path" so a document that repeats one image doesn't
-// re-mint it, and a remount of the viewer reuses an already-fresh URL.
-const driveImageCache = new Map<string, DriveImageCacheEntry | Promise<DriveImageCacheEntry>>()
-const MIN_FRESH_MS = 5 * 60 * 1000
-
-function cacheKey(res: DriveImageResolution): string {
-  return `${res.orgId}/${res.driveId}/${res.path}`
-}
+export type { DriveImageResolution }
 
 async function mintDriveImageUrl(client: AgentFsClient, res: DriveImageResolution): Promise<DriveImageCacheEntry> {
   const result = await client.getSignedUrl(res.orgId, res.driveId, res.path)
@@ -75,7 +57,8 @@ async function mintDriveImageUrl(client: AgentFsClient, res: DriveImageResolutio
  * and can repeat the same image many times in one document.
  */
 export function useDriveImageUrl(res: DriveImageResolution | null) {
-  const { client } = useAuth()
+  const { client, credential } = useAuth()
+  const clientId = credential.id
   const [url, setUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
@@ -88,11 +71,10 @@ export function useDriveImageUrl(res: DriveImageResolution | null) {
       return
     }
 
-    const key = cacheKey(res)
-    const cached = driveImageCache.get(key)
+    const cached = driveImageCache.getFresh(clientId, res)
     let cancelled = false
 
-    if (cached && !(cached instanceof Promise) && cached.expiresAt - Date.now() > MIN_FRESH_MS) {
+    if (cached) {
       setUrl(cached.url)
       setError(null)
       setIsLoading(false)
@@ -102,29 +84,30 @@ export function useDriveImageUrl(res: DriveImageResolution | null) {
     setIsLoading(true)
     setError(null)
 
-    const pending = cached instanceof Promise ? cached : mintDriveImageUrl(client, res)
-    driveImageCache.set(key, pending)
+    const existing = driveImageCache.get(clientId, res)
+    const pending = existing instanceof Promise ? existing : mintDriveImageUrl(client, res)
+    driveImageCache.set(clientId, res, pending)
     pending.then((entry) => {
-      driveImageCache.set(key, entry)
+      driveImageCache.set(clientId, res, entry)
       if (cancelled) return
       setUrl(entry.url)
       setError(null)
       setIsLoading(false)
     }).catch((err: unknown) => {
-      driveImageCache.delete(key)
+      driveImageCache.delete(clientId, res)
       if (cancelled) return
       setError((err as Error).message)
       setIsLoading(false)
     })
 
     return () => { cancelled = true }
-  }, [res?.orgId, res?.driveId, res?.path, client, nonce])
+  }, [res?.orgId, res?.driveId, res?.path, client, clientId, nonce])
 
   // Drops the cached entry and re-mints — used for the single-retry-on-load-error path.
   const retry = useCallback(() => {
-    if (res) driveImageCache.delete(cacheKey(res))
+    if (res) driveImageCache.delete(clientId, res)
     setNonce((n) => n + 1)
-  }, [res?.orgId, res?.driveId, res?.path])
+  }, [res?.orgId, res?.driveId, res?.path, clientId])
 
   return { url, error, isLoading, retry }
 }
