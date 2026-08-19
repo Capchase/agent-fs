@@ -6,7 +6,7 @@ import { MessageSquarePlus, MessageSquare, Maximize2, Minimize2, ListTree } from
 import { cn } from "@/lib/utils"
 import { AddComment } from "@/components/comments/AddComment"
 import { MermaidDiagram } from "./MermaidDiagram"
-import { ExpandableImage } from "./ExpandableImage"
+import { MarkdownImage, MarkdownDocContext } from "./MarkdownImage"
 import { CodeBlock } from "./CodeBlock"
 import { Button } from "@/components/ui/button"
 import {
@@ -48,7 +48,7 @@ const markdownComponents: Components = {
   },
   img({ src, alt, title }) {
     if (typeof src !== "string" || !src) return null
-    return <ExpandableImage src={src} alt={alt} title={title} />
+    return <MarkdownImage src={src} alt={alt} title={title} />
   },
 }
 
@@ -518,7 +518,9 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
           )}
         >
           {frontmatter && <FrontmatterBlock data={frontmatter} />}
-          {renderedMarkdown}
+          <MarkdownDocContext.Provider value={path}>
+            {renderedMarkdown}
+          </MarkdownDocContext.Provider>
         </div>
       </div>
 
