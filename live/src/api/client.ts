@@ -101,8 +101,12 @@ export class AgentFsClient {
     return this.get<OrgMembersResult>(`/orgs/${orgId}/members`)
   }
 
-  async getSignedUrl(orgId: string, driveId: string, path: string): Promise<{ url: string; expiresAt: string }> {
-    return this.callOp<{ url: string; expiresAt: string }>(
+  async getSignedUrl(
+    orgId: string,
+    driveId: string,
+    path: string,
+  ): Promise<{ url: string; expiresAt: string; expiresIn?: number; kind?: "presigned" | "app" }> {
+    return this.callOp<{ url: string; expiresAt: string; expiresIn?: number; kind?: "presigned" | "app" }>(
       orgId,
       "signed-url",
       { path },
