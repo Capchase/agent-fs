@@ -96,6 +96,8 @@ export function fileRoutes(
   //   - If-Match: <version>            → expectedVersion: <version>
   //   - If-None-Match: *               → expectedVersion: 0 (create only)
   //   - X-Agent-FS-Message: <message>  → version message
+  //   - X-Agent-FS-Message-Encoding: percent → the message above is
+  //     percent-encoded and must be decoded before use.
   //
   // Reuses the in-process `writeRaw` helper, which enforces editor-or-better
   // drive RBAC (viewers get 403 PERMISSION_DENIED, matching the JSON `write`
@@ -161,7 +163,27 @@ export function fileRoutes(
       expectedVersion = parsed;
     }
 
-    const message = c.req.header("X-Agent-FS-Message") ?? undefined;
+    // Some clients percent-encode this header because raw fetch Headers
+    // reject non-Latin-1 values (e.g. an em dash) — they flag that with
+    // X-Agent-FS-Message-Encoding: percent. Only decode when that flag is
+    // present: an unconditional decode can't tell "this was encoded by us"
+    // from "this literally contains a percent sign" (e.g. "50% done" or a
+    // client that hasn't been migrated to encode yet), and would silently
+    // mangle the latter.
+    const rawMessage = c.req.header("X-Agent-FS-Message");
+    const messageEncoding = c.req.header("X-Agent-FS-Message-Encoding");
+    let message: string | undefined;
+    if (rawMessage !== undefined) {
+      if (messageEncoding === "percent") {
+        try {
+          message = decodeURIComponent(rawMessage);
+        } catch {
+          message = rawMessage;
+        }
+      } else {
+        message = rawMessage;
+      }
+    }
 
     // Read body. Hono's bodyLimit middleware already caps this at 50 MB.
     const arrayBuffer = await c.req.arrayBuffer();
