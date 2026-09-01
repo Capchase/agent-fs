@@ -37,13 +37,15 @@ curl http://localhost:7433/health
 
 ### `POST /auth/register`
 
-Register a new user. Returns user ID, org ID, drive ID, and API key.
+Register a new user. Returns user ID, org ID, drive ID, and API key. The key is shown only once — it isn't stored anywhere but the user's own `config.json`.
 
 ```bash
 curl -X POST http://localhost:7433/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email": "agent@example.com"}'
 ```
+
+A lost key is recoverable: the owner runs `agent-fs auth reset-key`, or an org admin runs `agent-fs member reset-key <email>` on their behalf. Either rotates the key and invalidates the old one immediately.
 
 ### `GET /auth/me`
 
