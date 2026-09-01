@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createDatabase, schema } from "../../db/index.js";
 import type { DB } from "../../db/index.js";
-import { createUser, getUserByApiKey, getUserByEmail, resetApiKey } from "../users.js";
+import {
+  createUser,
+  getUserByApiKey,
+  getUserByEmail,
+  resetApiKey,
+  resetApiKeyOrgless,
+} from "../users.js";
 import { createOrg, listUserOrgs, getOrg, inviteToOrg } from "../orgs.js";
 import {
   createDrive,
@@ -172,6 +178,43 @@ describe("resetApiKey", () => {
         orgId,
       })
     ).toThrow(NotFoundError);
+  });
+});
+
+describe("resetApiKeyOrgless", () => {
+  // No CLI/HTTP path can reach this state today (every registration
+  // auto-creates a personal org, and its last admin can never be removed —
+  // see `removeOrgMember`), so this simulates it directly at the DB layer by
+  // stripping the user's org membership after creation, matching the
+  // orgless fallback `POST /auth/reset-key` takes when `listUserOrgs`
+  // returns zero rows.
+  test("rotates the key with no orgId to attach an event to", () => {
+    const created = createUser(db, { email: "reset-orgless@example.com" });
+    const oldKey = created.apiKey;
+
+    db.delete(schema.orgMembers)
+      .where(require("drizzle-orm").eq(schema.orgMembers.userId, created.user.id))
+      .run();
+    expect(listUserOrgs(db, created.user.id).length).toBe(0);
+
+    const result = resetApiKeyOrgless(db, created.user.id);
+
+    expect(result.apiKey).toMatch(/^af_[0-9a-f]{64}$/);
+    expect(result.apiKey).not.toBe(oldKey);
+    expect(getUserByApiKey(db, oldKey)).toBeNull();
+    const byNewKey = getUserByApiKey(db, result.apiKey);
+    expect(byNewKey).not.toBeNull();
+    expect(byNewKey!.id).toBe(created.user.id);
+
+    // No orgId to attach an api_key_reset event to (events.orgId is a NOT
+    // NULL FK) — confirm none was written, matching the documented gap.
+    const eventRows = db
+      .select()
+      .from(schema.events)
+      .where(require("drizzle-orm").eq(schema.events.resourceId, created.user.id))
+      .all()
+      .filter((e) => e.type === "api_key_reset");
+    expect(eventRows.length).toBe(0);
   });
 });
 

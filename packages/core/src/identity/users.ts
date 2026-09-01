@@ -101,13 +101,19 @@ export function resetApiKey(
 
 /**
  * Fallback for the impossible-in-practice case of a user with no orgs
- * (every user gets an auto-created personal org on registration): rotates
- * the key with no orgId to attach an audit event to, so it skips the event.
+ * (every user gets an auto-created personal org on registration, and the
+ * last admin can never be removed from a personal org — see
+ * `removeOrgMember`). Wrapped in a transaction to match `resetApiKey`'s
+ * atomicity guarantee. Cannot record an `api_key_reset` event like the
+ * org-scoped path does: `events.orgId` is a NOT NULL foreign key to `orgs`,
+ * and there is no orgId to attach an event to here.
  */
 export function resetApiKeyOrgless(db: DB, userId: string): { apiKey: string } {
   const apiKey = generateApiKey();
   const apiKeyHash = hashApiKey(apiKey);
-  db.update(schema.users).set({ apiKeyHash }).where(eq(schema.users.id, userId)).run();
+  db.transaction((tx) => {
+    tx.update(schema.users).set({ apiKeyHash }).where(eq(schema.users.id, userId)).run();
+  });
   return { apiKey };
 }
 
