@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createDatabase, schema } from "../../db/index.js";
 import type { DB } from "../../db/index.js";
-import { createUser, getUserByApiKey, getUserByEmail } from "../users.js";
+import { createUser, getUserByApiKey, getUserByEmail, resetApiKey } from "../users.js";
 import { createOrg, listUserOrgs, getOrg, inviteToOrg } from "../orgs.js";
 import {
   createDrive,
@@ -93,6 +93,85 @@ describe("User management", () => {
 
     expect(raw!.apiKeyHash).not.toBe(apiKey);
     expect(raw!.apiKeyHash).toMatch(/^[0-9a-f]{64}$/); // SHA-256 hex
+  });
+});
+
+describe("resetApiKey", () => {
+  test("issues a fresh key, invalidates the old one, and records an event", () => {
+    const created = createUser(db, { email: "reset-self@example.com" });
+    const orgId = listUserOrgs(db, created.user.id).find((o) => o.isPersonal)!
+      .id;
+    const oldKey = created.apiKey;
+
+    const result = resetApiKey(db, {
+      userId: created.user.id,
+      actorId: created.user.id,
+      orgId,
+    });
+
+    expect(result.user.id).toBe(created.user.id);
+    expect(result.apiKey).toMatch(/^af_[0-9a-f]{64}$/);
+    expect(result.apiKey).not.toBe(oldKey);
+
+    expect(getUserByApiKey(db, oldKey)).toBeNull();
+    const byNewKey = getUserByApiKey(db, result.apiKey);
+    expect(byNewKey).not.toBeNull();
+    expect(byNewKey!.id).toBe(created.user.id);
+
+    const eventRows = db
+      .select()
+      .from(schema.events)
+      .where(require("drizzle-orm").eq(schema.events.resourceId, created.user.id))
+      .all()
+      .filter((e) => e.type === "api_key_reset");
+    expect(eventRows.length).toBe(1);
+    expect(eventRows[0].actor).toBe(created.user.id);
+    expect(JSON.parse(eventRows[0].metadata!)).toEqual({ method: "self" });
+  });
+
+  test("admin reset records actor distinct from target", () => {
+    const admin = createUser(db, { email: "reset-admin@example.com" });
+    const orgId = listUserOrgs(db, admin.user.id).find((o) => o.isPersonal)!
+      .id;
+    const target = createUser(db, { email: "reset-target@example.com" }).user;
+    inviteToOrg(db, {
+      orgId,
+      email: "reset-target@example.com",
+      role: "viewer",
+    });
+
+    const result = resetApiKey(db, {
+      userId: target.id,
+      actorId: admin.user.id,
+      orgId,
+    });
+
+    expect(result.user.email).toBe("reset-target@example.com");
+
+    const eventRows = db
+      .select()
+      .from(schema.events)
+      .where(require("drizzle-orm").eq(schema.events.resourceId, target.id))
+      .all()
+      .filter((e) => e.type === "api_key_reset");
+    expect(eventRows.length).toBe(1);
+    expect(eventRows[0].actor).toBe(admin.user.id);
+    expect(eventRows[0].target).toBe(target.id);
+    expect(JSON.parse(eventRows[0].metadata!)).toEqual({ method: "admin" });
+  });
+
+  test("throws NotFoundError for an unknown userId", () => {
+    const admin = createUser(db, { email: "reset-unknown@example.com" });
+    const orgId = listUserOrgs(db, admin.user.id).find((o) => o.isPersonal)!
+      .id;
+
+    expect(() =>
+      resetApiKey(db, {
+        userId: "00000000-0000-4000-8000-000000000000",
+        actorId: admin.user.id,
+        orgId,
+      })
+    ).toThrow(NotFoundError);
   });
 });
 

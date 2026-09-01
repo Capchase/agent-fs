@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { schema } from "../db/index.js";
 import type { DB } from "../db/index.js";
 import { createOrg } from "./orgs.js";
+import { NotFoundError } from "../errors.js";
 
 function hashApiKey(key: string): string {
   const hasher = new Bun.CryptoHasher("sha256");
@@ -46,6 +47,56 @@ export function createUser(
   });
 
   return { user: { id, email: params.email }, apiKey };
+}
+
+export interface ResetApiKeyResult {
+  user: { id: string; email: string };
+  apiKey: string; // Only returned on reset
+}
+
+export function resetApiKey(
+  db: DB,
+  params: { userId: string; actorId: string; orgId: string }
+): ResetApiKeyResult {
+  const existing = db
+    .select()
+    .from(schema.users)
+    .where(eq(schema.users.id, params.userId))
+    .get();
+
+  if (!existing) {
+    throw new NotFoundError("User not found", { suggestion: "Check the user id" });
+  }
+
+  const apiKey = generateApiKey();
+  const apiKeyHash = hashApiKey(apiKey);
+  const now = new Date();
+
+  db.transaction((tx) => {
+    tx.update(schema.users)
+      .set({ apiKeyHash })
+      .where(eq(schema.users.id, params.userId))
+      .run();
+
+    tx.insert(schema.events)
+      .values({
+        id: crypto.randomUUID(),
+        orgId: params.orgId,
+        type: "api_key_reset",
+        resourceType: "user",
+        resourceId: params.userId,
+        actor: params.actorId,
+        target: params.userId,
+        status: "created",
+        metadata: JSON.stringify({
+          method: params.actorId === params.userId ? "self" : "admin",
+        }),
+        createdAt: now,
+      })
+      .run();
+  });
+
+  return { user: { id: existing.id, email: existing.email }, apiKey };
 }
 
 export function getUserByApiKey(
