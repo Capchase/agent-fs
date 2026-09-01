@@ -2235,6 +2235,107 @@ async function runStandardTests(daemonUrl: string) {
     }
   });
 
+  await test(
+    "IPC daemon credential survives a self-reset without a restart (FUSE-mount lockout regression)",
+    async () => {
+      // The HTTP-level reset-key tests above don't exercise this bug: HTTP
+      // auth is validated per-request straight against the DB. The daemon's
+      // IPC listener — what a mounted FUSE drive actually talks to — used to
+      // resolve the bearer key from a `config` object read once at process
+      // startup (packages/server/src/index.ts:105), so an existing or
+      // freshly-mounted drive kept authenticating with the revoked key until
+      // the daemon was restarted. This connects to the real running daemon's
+      // Unix socket, the same one the Rust FUSE helper speaks to, and proves
+      // the fix (rereading getConfig() per call) needs no restart.
+      const { Packr, Unpackr } = await import("msgpackr");
+      const packr = new Packr({ useRecords: false });
+      const unpackr = new Unpackr({ useRecords: false });
+
+      function ipcRoundTrip(socketPath: string, body: unknown): Promise<any> {
+        const buf = packr.pack({ id: 1, body });
+        const lenBuf = Buffer.alloc(4);
+        lenBuf.writeUInt32BE(buf.length, 0);
+        const frame = Buffer.concat([lenBuf, buf as unknown as Buffer]);
+        return new Promise((resolve, reject) => {
+          let recvBuf = Buffer.alloc(0);
+          let timeout: ReturnType<typeof setTimeout>;
+          Bun.connect({
+            unix: socketPath,
+            socket: {
+              open(socket) {
+                socket.write(frame);
+                timeout = setTimeout(() => {
+                  reject(new Error("ipc roundTrip timed out"));
+                  socket.end();
+                }, 5000);
+              },
+              data(socket, chunk) {
+                recvBuf = Buffer.concat([recvBuf, chunk]);
+                if (recvBuf.length < 4) return;
+                const len = recvBuf.readUInt32BE(0);
+                if (recvBuf.length < 4 + len) return;
+                const env = unpackr.unpack(recvBuf.subarray(4, 4 + len)) as {
+                  id: number;
+                  body: unknown;
+                };
+                clearTimeout(timeout);
+                socket.end();
+                resolve(env.body);
+              },
+              error(_socket, err) {
+                clearTimeout(timeout);
+                reject(err);
+              },
+            },
+          }).catch(reject);
+        });
+      }
+
+      const socketPath = join(testDir, "agent-fs.sock");
+
+      const regRes = await fetch(`${daemonUrl}/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "reset-ipc-mount@e2e.local" }),
+      });
+      assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+      const regData = (await regRes.json()) as any;
+      const oldKey = regData.apiKey;
+
+      const configPath = join(testDir, "config.json");
+      const original = readFileSync(configPath, "utf-8");
+      const config = JSON.parse(original);
+      config.auth.apiKey = oldKey;
+      writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+      try {
+        // Sanity check: the daemon's IPC listener authenticates the freshly
+        // registered key before any reset happens.
+        const before: any = await ipcRoundTrip(socketPath, { op: "list_drives" });
+        assert(
+          Array.isArray(before.drives),
+          true,
+          `Expected drives array before reset, got: ${JSON.stringify(before)}`
+        );
+
+        // Reset via the real CLI path, against the real running daemon —
+        // no restart between this call and the next IPC round trip.
+        const out = runWithEnv("auth reset-key", { AGENT_FS_API_KEY: oldKey });
+        const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+        assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+
+        const after: any = await ipcRoundTrip(socketPath, { op: "list_drives" });
+        assert(
+          Array.isArray(after.drives),
+          true,
+          `Expected the IPC listener to accept the rotated key without a daemon restart, got: ${JSON.stringify(after)}`
+        );
+      } finally {
+        writeFileSync(configPath, original);
+      }
+    }
+  );
+
   // Switch back and clean up config
   run(`org switch ${personalOrgId}`);
 
