@@ -48,11 +48,21 @@ export function authCommands(client: ApiClient) {
     .command("reset-key")
     .description("Reset your own API key (the old key stops working)")
     .action(async () => {
+      const json = cmd.parent?.opts().json;
       try {
         const result = await client.post("/auth/reset-key", {});
-        console.log(`New API key: ${result.apiKey}`);
+        // api-client.ts reads `config.apiKey ?? config.auth.apiKey` — write
+        // both fields so whichever one it resolves holds the fresh key. A
+        // stale top-level `apiKey` (e.g. from the dashboard onboarding path)
+        // would otherwise keep winning over the freshly-rotated auth.apiKey.
         setConfigValue("auth.apiKey", result.apiKey);
+        setConfigValue("apiKey", result.apiKey);
         client.setApiKey(result.apiKey);
+        if (json) {
+          console.log(JSON.stringify({ apiKey: result.apiKey }, null, 2));
+          return;
+        }
+        console.log(`New API key: ${result.apiKey}`);
         console.log("API key saved to config. The old key is now invalid on the server.");
       } catch (err: any) {
         console.error(`Error: ${err.message}`);
