@@ -16,6 +16,7 @@ import {
   roleAtLeast,
   requireDriveAdmin,
   assertDriveInOrg,
+  resetApiKey,
   NotFoundError,
   PermissionDeniedError,
 } from "@/core";
@@ -131,6 +132,24 @@ export function orgRoutes(db: DB) {
     } catch (err: any) {
       return c.json({ error: "BAD_REQUEST", message: err.message }, 400);
     }
+  });
+
+  router.post("/:orgId/members/:userId/reset-key", (c) => {
+    const user = c.get("user");
+    const orgId = c.req.param("orgId");
+    const targetUserId = c.req.param("userId");
+    requireOrgAdmin(db, user.id, orgId);
+    requireOrgMember(db, targetUserId, orgId);
+    const result = resetApiKey(db, {
+      userId: targetUserId,
+      actorId: user.id,
+      orgId,
+    });
+    return c.json({
+      apiKey: result.apiKey,
+      userId: result.user.id,
+      email: result.user.email,
+    });
   });
 
   router.delete("/:orgId/members/:userId", (c) => {

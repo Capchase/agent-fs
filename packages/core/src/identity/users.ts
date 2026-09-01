@@ -99,6 +99,18 @@ export function resetApiKey(
   return { user: { id: existing.id, email: existing.email }, apiKey };
 }
 
+/**
+ * Fallback for the impossible-in-practice case of a user with no orgs
+ * (every user gets an auto-created personal org on registration): rotates
+ * the key with no orgId to attach an audit event to, so it skips the event.
+ */
+export function resetApiKeyOrgless(db: DB, userId: string): { apiKey: string } {
+  const apiKey = generateApiKey();
+  const apiKeyHash = hashApiKey(apiKey);
+  db.update(schema.users).set({ apiKeyHash }).where(eq(schema.users.id, userId)).run();
+  return { apiKey };
+}
+
 export function getUserByApiKey(
   db: DB,
   apiKey: string

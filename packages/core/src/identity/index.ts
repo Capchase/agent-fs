@@ -1,4 +1,10 @@
-export { createUser, getUserByApiKey, getUserByEmail, resetApiKey } from "./users.js";
+export {
+  createUser,
+  getUserByApiKey,
+  getUserByEmail,
+  resetApiKey,
+  resetApiKeyOrgless,
+} from "./users.js";
 export type { ResetApiKeyResult } from "./users.js";
 export { createOrg, listUserOrgs, getOrg, inviteToOrg, listOrgMembers, updateOrgMemberRole, removeOrgMember } from "./orgs.js";
 export { createDrive, listDrives, listDrivesForUser, getDrive, setDriveMember, listDriveMembers, updateDriveMemberRole, removeDriveMember } from "./drives.js";
