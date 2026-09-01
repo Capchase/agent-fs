@@ -86,6 +86,38 @@ export function memberCommands(
     });
 
   cmd
+    .command("reset-key")
+    .argument("<email>", "User email whose key to reset")
+    .description("Reset a member's API key (org admin only)")
+    .action(async (email: string) => {
+      const json = cmd.parent?.opts().json;
+      try {
+        const orgId = await getOrgId();
+        const userId = await resolveUserId(client, orgId, email);
+        const result = await client.post(
+          `/orgs/${orgId}/members/${userId}/reset-key`,
+          {}
+        );
+        if (json) {
+          console.log(
+            JSON.stringify(
+              { apiKey: result.apiKey, userId: result.userId, email: result.email },
+              null,
+              2
+            )
+          );
+          return;
+        }
+        console.log(`New API key for ${email}: ${result.apiKey}`);
+        console.log("Give this key to the user on a secure channel. The old key is now invalid.");
+        console.log("This key is shown only once and grants full access to the user's account.");
+      } catch (err: any) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
     .command("remove")
     .argument("<email>", "User email to remove")
     .description("Remove a member from org (or drive only if --drive is set)")

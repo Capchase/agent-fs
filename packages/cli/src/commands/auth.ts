@@ -45,6 +45,22 @@ export function authCommands(client: ApiClient) {
     });
 
   cmd
+    .command("reset-key")
+    .description("Reset your own API key (the old key stops working)")
+    .action(async () => {
+      try {
+        const result = await client.post("/auth/reset-key", {});
+        console.log(`New API key: ${result.apiKey}`);
+        setConfigValue("auth.apiKey", result.apiKey);
+        client.setApiKey(result.apiKey);
+        console.log("API key saved to config. The old key is now invalid on the server.");
+      } catch (err: any) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+    });
+
+  cmd
     .command("whoami")
     .description("Show current user info")
     .action(async () => {
