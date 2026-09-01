@@ -16,6 +16,9 @@ import {
   listUserOrgs,
   listDrives,
   setDriveMember,
+  resetApiKeyOrgless,
+  getConfig,
+  setConfigValue,
 } from "../../../../core/src/index.js";
 import { startIpcServer } from "../server.js";
 
@@ -341,6 +344,81 @@ describe("IPC server — round-trip", () => {
     });
     expect(editorWrite.open_write).toBeDefined();
     expect(editorWrite.open_write.version).toBe(2);
+  });
+});
+
+describe("IPC server — daemon credential after a self-reset (no restart)", () => {
+  // packages/server/src/index.ts:16 reads `const config = getConfig()` once
+  // at process startup. Before the fix, the IPC resolveApiKey closure
+  // returned that frozen snapshot forever, so a self-reset (which rewrites
+  // config.json but not that snapshot) locked out every FUSE mount until the
+  // daemon was restarted. The fix rereads getConfig() on every call, since
+  // getConfig() itself does a fresh disk read with no cache (packages/core/
+  // src/config.ts). This test runs both the frozen and the fresh resolver
+  // against ONE running daemon to prove the fix needs no restart.
+  let tmpHome: string;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "agent-fs-home-test-"));
+    prevHome = process.env.AGENT_FS_HOME;
+    process.env.AGENT_FS_HOME = tmpHome;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.AGENT_FS_HOME;
+    else process.env.AGENT_FS_HOME = prevHome;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  test("frozen-at-startup resolver 401s after reset; getConfig()-per-call resolver keeps working", async () => {
+    const db = createTestDb();
+    const s3 = new MockS3Client();
+    const { user, apiKey } = createUser(db, { email: "reset-ipc@example.com" });
+    setConfigValue("auth.apiKey", apiKey);
+
+    // Mirrors the buggy packages/server/src/index.ts:16 — read once, before
+    // the daemon has ever seen a reset.
+    const configAtStartup = getConfig();
+    let useFrozenSnapshot = false;
+
+    const socketPath = join(tmpHome, "ipc.sock");
+    const server = startIpcServer(socketPath, {
+      db,
+      s3: s3 as any,
+      embeddingProvider: null,
+      resolveApiKey: () =>
+        (useFrozenSnapshot ? configAtStartup : getConfig()).auth?.apiKey ?? null,
+    });
+
+    try {
+      // Sanity check: both patterns authenticate before any reset happens.
+      const before: any = await roundTrip(socketPath, { op: "list_drives" });
+      expect(before.drives).toBeInstanceOf(Array);
+
+      // Simulate `agent-fs auth reset-key`: rotate the DB-side key hash (the
+      // server-side half of /auth/reset-key) and persist the new key to
+      // config.json (the CLI-side half in auth.ts) — no daemon restart.
+      const { apiKey: newApiKey } = resetApiKeyOrgless(db, user.id);
+      setConfigValue("auth.apiKey", newApiKey);
+
+      // Pre-fix behavior: the resolver frozen at startup keeps offering the
+      // now-revoked key, so the FUSE-mount auth path fails without a restart.
+      useFrozenSnapshot = true;
+      const stale: any = await roundTrip(socketPath, { op: "list_drives" });
+      expect(stale.error).toBeDefined();
+      expect(stale.error.http_status).toBe(401);
+      expect(stale.error.code).toBe("AUTH_MISSING");
+
+      // Fixed behavior: rereading getConfig() picks up the rotated key on
+      // the very next call, on the same running daemon.
+      useFrozenSnapshot = false;
+      const fresh: any = await roundTrip(socketPath, { op: "list_drives" });
+      expect(fresh.drives).toBeInstanceOf(Array);
+      expect(fresh.drives[0].slug).toBe(listDrives(db, listUserOrgs(db, user.id)[0].id)[0].name);
+    } finally {
+      server.stop();
+    }
   });
 });
 
