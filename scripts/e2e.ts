@@ -2052,6 +2052,74 @@ async function runStandardTests(daemonUrl: string) {
     }
   });
 
+  // -- API key reset --
+
+  await test("self reset: auth reset-key issues a fresh key and invalidates the old one", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-self@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const out = runWithEnv("auth reset-key", { AGENT_FS_API_KEY: oldKey });
+    assertIncludes(out, "New API key:");
+    const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+    assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+    const newKey = match![1];
+    assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+    const oldRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${oldKey}` },
+    });
+    assert(oldRes.status, 401, `Expected old key to be invalidated (401), got ${oldRes.status}`);
+
+    const newRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${newKey}` },
+    });
+    assert(newRes.status, 200, `Expected new key to work (200), got ${newRes.status}`);
+  });
+
+  await test("admin reset: member reset-key rotates an invited member's key", async () => {
+    // Personal orgs disallow member removal entirely, so this runs against
+    // the second (shared) org used by the invite/remove tests above.
+    run(`org switch ${secondOrgId}`);
+
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-member@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const memberData = (await regRes.json()) as any;
+    const oldMemberKey = memberData.apiKey;
+
+    run("member invite reset-member@e2e.local --role viewer");
+
+    const out = run("member reset-key reset-member@e2e.local");
+    assertIncludes(out, "New API key for reset-member@e2e.local:");
+    assertIncludes(out, "old key is now invalid");
+    const match = out.match(/New API key for reset-member@e2e\.local: (af_[0-9a-f]{64})/);
+    assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+    const newMemberKey = match![1];
+
+    const oldRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${oldMemberKey}` },
+    });
+    assert(oldRes.status, 401, `Expected old member key to be invalidated (401), got ${oldRes.status}`);
+
+    const newRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${newMemberKey}` },
+    });
+    assert(newRes.status, 200, `Expected new member key to work (200), got ${newRes.status}`);
+
+    // Clean up, then switch back to the personal org for the tests that follow.
+    run("member remove reset-member@e2e.local");
+    run(`org switch ${personalOrgId}`);
+  });
+
   // Switch back and clean up config
   run(`org switch ${personalOrgId}`);
 
@@ -2880,8 +2948,10 @@ async function runFuseTests() {
   });
 
   // 8. Auth-expired: kill the daemon's auth and assert EACCES (or auth error in .agent-fs/status).
-  //    Implementation note: a real revocation API doesn't exist yet in v1; we approximate
-  //    by truncating the API key in the config so the next op gets 401 → EACCES.
+  //    Implementation note: a real revocation API exists now (POST /auth/reset-key,
+  //    see "self reset" / "admin reset" in the CLI suite above); this FUSE test still
+  //    corrupts the local config's key directly because it's exercising the mount's
+  //    read path for an already-invalid key, not the reset op itself.
   await fuseTest("auth-expired: corrupted api-key surfaces auth error", async () => {
     runFuseCmd(`mkdir -p /mnt/agent-fs`);
     inFs(`mount /mnt/agent-fs`);
