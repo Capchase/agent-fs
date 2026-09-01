@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import type { ApiClient } from "../api-client.js";
+import { setConfigValue } from "@/core";
 
 export function memberCommands(
   client: ApiClient,
@@ -98,6 +99,19 @@ export function memberCommands(
           `/orgs/${orgId}/members/${userId}/reset-key`,
           {}
         );
+        // An admin can target their own email (e.g. lost their local key but
+        // still knows their old one, or is rotating on a schedule). The
+        // server-side reset invalidates the caller's own credential in that
+        // case, so persist the fresh key locally the same way `auth
+        // reset-key` does — otherwise the admin is locked out by their own
+        // successful reset.
+        const me = await client.getMe();
+        const isSelf = me.userId === result.userId;
+        if (isSelf) {
+          setConfigValue("auth.apiKey", result.apiKey);
+          setConfigValue("apiKey", result.apiKey);
+          client.setApiKey(result.apiKey);
+        }
         if (json) {
           console.log(
             JSON.stringify(
@@ -111,6 +125,9 @@ export function memberCommands(
         console.log(`New API key for ${email}: ${result.apiKey}`);
         console.log("Give this key to the user on a secure channel. The old key is now invalid.");
         console.log("This key is shown only once and grants full access to the user's account.");
+        if (isSelf) {
+          console.log("This is your own account — the new key has been saved to your local config.");
+        }
       } catch (err: any) {
         console.error(`Error: ${err.message}`);
         process.exit(1);
