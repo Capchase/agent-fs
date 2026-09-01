@@ -95,18 +95,21 @@ export function memberCommands(
       try {
         const orgId = await getOrgId();
         const userId = await resolveUserId(client, orgId, email);
+        // An admin can target their own email (e.g. lost their local key but
+        // still knows their old one, or is rotating on a schedule). Resolve
+        // self-target BEFORE the reset call: the reset invalidates the
+        // caller's own current key, so checking identity afterwards with the
+        // now-stale key would 401.
+        const me = await client.getMe();
+        const isSelf = me.userId === userId;
         const result = await client.post(
           `/orgs/${orgId}/members/${userId}/reset-key`,
           {}
         );
-        // An admin can target their own email (e.g. lost their local key but
-        // still knows their old one, or is rotating on a schedule). The
-        // server-side reset invalidates the caller's own credential in that
-        // case, so persist the fresh key locally the same way `auth
-        // reset-key` does — otherwise the admin is locked out by their own
-        // successful reset.
-        const me = await client.getMe();
-        const isSelf = me.userId === result.userId;
+        // The server-side reset invalidates the caller's own credential in
+        // the self-target case, so persist the fresh key locally the same
+        // way `auth reset-key` does — otherwise the admin is locked out by
+        // their own successful reset.
         if (isSelf) {
           setConfigValue("auth.apiKey", result.apiKey);
           setConfigValue("apiKey", result.apiKey);
