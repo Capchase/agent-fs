@@ -112,6 +112,16 @@ const testEnv = (): NodeJS.ProcessEnv => {
     AGENT_FS_DEFAULT_DRIVE_ID: "",
     AGENT_FS_SHARED_ORG_ID: "",
     BUCKET_NAME: "",
+    // Same story for API credentials: `run`/`runWithEnv` override these
+    // explicitly per-call, but `runRaw` (used by tests that deliberately
+    // exercise config-file-only auth resolution) does not — a stray
+    // AGENT_FS_API_KEY/AGENT_FS_API_URL from an agent-swarm worker's own
+    // real agent-fs account would otherwise leak through and point the CLI
+    // at production instead of this ephemeral test daemon. `undefined` (not
+    // "") so api-client.ts's `??` fallback to config still applies — an
+    // empty string is not nullish and would short-circuit it.
+    AGENT_FS_API_KEY: undefined,
+    AGENT_FS_API_URL: undefined,
   };
 
   if (localOnly) {
@@ -2052,6 +2062,280 @@ async function runStandardTests(daemonUrl: string) {
     }
   });
 
+  // -- API key reset --
+
+  await test("self reset: auth reset-key issues a fresh key and invalidates the old one", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-self@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const out = runWithEnv("auth reset-key", { AGENT_FS_API_KEY: oldKey });
+    assertIncludes(out, "New API key:");
+    const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+    assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+    const newKey = match![1];
+    assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+    const oldRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${oldKey}` },
+    });
+    assert(oldRes.status, 401, `Expected old key to be invalidated (401), got ${oldRes.status}`);
+
+    const newRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${newKey}` },
+    });
+    assert(newRes.status, 200, `Expected new key to work (200), got ${newRes.status}`);
+  });
+
+  await test("admin reset: member reset-key rotates an invited member's key", async () => {
+    // Personal orgs disallow member removal entirely, so this runs against
+    // the second (shared) org used by the invite/remove tests above.
+    run(`org switch ${secondOrgId}`);
+
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-member@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const memberData = (await regRes.json()) as any;
+    const oldMemberKey = memberData.apiKey;
+
+    run("member invite reset-member@e2e.local --role viewer");
+
+    const out = run("member reset-key reset-member@e2e.local");
+    assertIncludes(out, "New API key for reset-member@e2e.local:");
+    assertIncludes(out, "old key is now invalid");
+    const match = out.match(/New API key for reset-member@e2e\.local: (af_[0-9a-f]{64})/);
+    assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+    const newMemberKey = match![1];
+
+    const oldRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${oldMemberKey}` },
+    });
+    assert(oldRes.status, 401, `Expected old member key to be invalidated (401), got ${oldRes.status}`);
+
+    const newRes = await fetch(`${daemonUrl}/auth/me`, {
+      headers: { Authorization: `Bearer ${newMemberKey}` },
+    });
+    assert(newRes.status, 200, `Expected new member key to work (200), got ${newRes.status}`);
+
+    // Clean up, then switch back to the personal org for the tests that follow.
+    run("member remove reset-member@e2e.local");
+    run(`org switch ${personalOrgId}`);
+  });
+
+  await test("self reset: auth reset-key --json returns structured output", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-json@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+
+    const out = runWithEnv("--json auth reset-key", { AGENT_FS_API_KEY: regData.apiKey });
+    const parsed = JSON.parse(out);
+    assert(typeof parsed.apiKey, "string", "Expected --json output to include an apiKey string");
+    assert(!out.includes("New API key:"), true, "Expected --json output to skip the plain-text banner");
+  });
+
+  await test("persisted-key path: auth reset-key updates the config field api-client reads", async () => {
+    // api-client.ts resolves `config.apiKey ?? config.auth.apiKey`. Simulate
+    // the dashboard-onboarding shape (only the top-level field populated) to
+    // reproduce the bug where a reset only updated auth.apiKey and left the
+    // client reading a stale, now-invalid top-level key.
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-persisted@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const configPath = join(testDir, "config.json");
+    const original = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(original);
+    config.apiKey = oldKey;
+    config.auth.apiKey = "";
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    try {
+      // No AGENT_FS_API_KEY override — relies entirely on persisted config,
+      // same as a real interactive session would.
+      const out = runRaw("auth reset-key");
+      assertIncludes(out, "New API key:");
+      const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+      assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+      const newKey = match![1];
+      assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+      const updated = JSON.parse(readFileSync(configPath, "utf-8"));
+      assert(updated.apiKey, newKey, "Expected top-level config.apiKey to hold the fresh key");
+      assert(updated.auth.apiKey, newKey, "Expected config.auth.apiKey to hold the fresh key");
+
+      // A follow-up command relying purely on the persisted config (no env
+      // override) must authenticate with the new key, not 401 on the stale one.
+      const whoamiOut = runRaw("auth whoami");
+      assertIncludes(whoamiOut, "reset-persisted@e2e.local");
+    } finally {
+      writeFileSync(configPath, original);
+    }
+  });
+
+  await test("admin self-target reset: member reset-key <own email> persists the new key locally", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-admin-self@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const configPath = join(testDir, "config.json");
+    const original = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(original);
+    config.auth.apiKey = oldKey;
+    delete config.apiKey;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    try {
+      // The freshly-registered user is admin of their own personal org, so
+      // targeting their own email exercises the admin self-reset path.
+      // --org pins the context explicitly: config.defaultOrg may still hold
+      // the primary test user's org from an earlier `org switch` test, which
+      // would misresolve getOrgId() for this different user/session.
+      const out = runRaw(`--org ${regData.orgId} member reset-key reset-admin-self@e2e.local`);
+      assertIncludes(out, "New API key for reset-admin-self@e2e.local:");
+      const match = out.match(/New API key for reset-admin-self@e2e\.local: (af_[0-9a-f]{64})/);
+      assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+      const newKey = match![1];
+      assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+      const updated = JSON.parse(readFileSync(configPath, "utf-8"));
+      assert(
+        updated.auth.apiKey,
+        newKey,
+        "Expected the admin's own reset to persist the fresh key to local config"
+      );
+
+      // A follow-up command relying purely on the persisted config must
+      // authenticate with the fresh key, not the invalidated old one.
+      const whoamiOut = runRaw("auth whoami");
+      assertIncludes(whoamiOut, "reset-admin-self@e2e.local");
+    } finally {
+      writeFileSync(configPath, original);
+    }
+  });
+
+  await test(
+    "IPC daemon credential survives a self-reset without a restart (FUSE-mount lockout regression)",
+    async () => {
+      // The HTTP-level reset-key tests above don't exercise this bug: HTTP
+      // auth is validated per-request straight against the DB. The daemon's
+      // IPC listener — what a mounted FUSE drive actually talks to — used to
+      // resolve the bearer key from a `config` object read once at process
+      // startup (packages/server/src/index.ts:105), so an existing or
+      // freshly-mounted drive kept authenticating with the revoked key until
+      // the daemon was restarted. This connects to the real running daemon's
+      // Unix socket, the same one the Rust FUSE helper speaks to, and proves
+      // the fix (rereading getConfig() per call) needs no restart.
+      const { Packr, Unpackr } = await import("msgpackr");
+      const packr = new Packr({ useRecords: false });
+      const unpackr = new Unpackr({ useRecords: false });
+
+      function ipcRoundTrip(socketPath: string, body: unknown): Promise<any> {
+        const buf = packr.pack({ id: 1, body });
+        const lenBuf = Buffer.alloc(4);
+        lenBuf.writeUInt32BE(buf.length, 0);
+        const frame = Buffer.concat([lenBuf, buf as unknown as Buffer]);
+        return new Promise((resolve, reject) => {
+          let recvBuf = Buffer.alloc(0);
+          let timeout: ReturnType<typeof setTimeout>;
+          Bun.connect({
+            unix: socketPath,
+            socket: {
+              open(socket) {
+                socket.write(frame);
+                timeout = setTimeout(() => {
+                  reject(new Error("ipc roundTrip timed out"));
+                  socket.end();
+                }, 5000);
+              },
+              data(socket, chunk) {
+                recvBuf = Buffer.concat([recvBuf, chunk]);
+                if (recvBuf.length < 4) return;
+                const len = recvBuf.readUInt32BE(0);
+                if (recvBuf.length < 4 + len) return;
+                const env = unpackr.unpack(recvBuf.subarray(4, 4 + len)) as {
+                  id: number;
+                  body: unknown;
+                };
+                clearTimeout(timeout);
+                socket.end();
+                resolve(env.body);
+              },
+              error(_socket, err) {
+                clearTimeout(timeout);
+                reject(err);
+              },
+            },
+          }).catch(reject);
+        });
+      }
+
+      const socketPath = join(testDir, "agent-fs.sock");
+
+      const regRes = await fetch(`${daemonUrl}/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "reset-ipc-mount@e2e.local" }),
+      });
+      assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+      const regData = (await regRes.json()) as any;
+      const oldKey = regData.apiKey;
+
+      const configPath = join(testDir, "config.json");
+      const original = readFileSync(configPath, "utf-8");
+      const config = JSON.parse(original);
+      config.auth.apiKey = oldKey;
+      writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+      try {
+        // Sanity check: the daemon's IPC listener authenticates the freshly
+        // registered key before any reset happens.
+        const before: any = await ipcRoundTrip(socketPath, { op: "list_drives" });
+        assert(
+          Array.isArray(before.drives),
+          true,
+          `Expected drives array before reset, got: ${JSON.stringify(before)}`
+        );
+
+        // Reset via the real CLI path, against the real running daemon —
+        // no restart between this call and the next IPC round trip.
+        const out = runWithEnv("auth reset-key", { AGENT_FS_API_KEY: oldKey });
+        const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+        assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+
+        const after: any = await ipcRoundTrip(socketPath, { op: "list_drives" });
+        assert(
+          Array.isArray(after.drives),
+          true,
+          `Expected the IPC listener to accept the rotated key without a daemon restart, got: ${JSON.stringify(after)}`
+        );
+      } finally {
+        writeFileSync(configPath, original);
+      }
+    }
+  );
+
   // Switch back and clean up config
   run(`org switch ${personalOrgId}`);
 
@@ -2880,8 +3164,10 @@ async function runFuseTests() {
   });
 
   // 8. Auth-expired: kill the daemon's auth and assert EACCES (or auth error in .agent-fs/status).
-  //    Implementation note: a real revocation API doesn't exist yet in v1; we approximate
-  //    by truncating the API key in the config so the next op gets 401 → EACCES.
+  //    Implementation note: a real revocation API exists now (POST /auth/reset-key,
+  //    see "self reset" / "admin reset" in the CLI suite above); this FUSE test still
+  //    corrupts the local config's key directly because it's exercising the mount's
+  //    read path for an already-invalid key, not the reset op itself.
   await fuseTest("auth-expired: corrupted api-key surfaces auth error", async () => {
     runFuseCmd(`mkdir -p /mnt/agent-fs`);
     inFs(`mount /mnt/agent-fs`);

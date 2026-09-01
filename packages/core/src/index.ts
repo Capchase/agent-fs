@@ -88,6 +88,8 @@ export {
   createUser,
   getUserByApiKey,
   getUserByEmail,
+  resetApiKey,
+  resetApiKeyOrgless,
   createOrg,
   listUserOrgs,
   getOrg,
@@ -115,7 +117,7 @@ export {
   resolveContext,
   ensureLocalUser,
 } from "./identity/index.js";
-export type { Role, ResolvedContext } from "./identity/index.js";
+export type { Role, ResolvedContext, ResetApiKeyResult } from "./identity/index.js";
 export { VERSION } from "./version.js";
 export { createEmbeddingProviderFromEnv } from "./search/embeddings/index.js";
 export type { EmbeddingProvider } from "./search/embeddings/index.js";

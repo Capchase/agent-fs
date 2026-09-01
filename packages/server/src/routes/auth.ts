@@ -1,5 +1,11 @@
 import { Hono } from "hono";
-import { createUser, listUserOrgs, resolveContext } from "@/core";
+import {
+  createUser,
+  listUserOrgs,
+  resolveContext,
+  resetApiKey,
+  resetApiKeyOrgless,
+} from "@/core";
 import type { DB } from "@/core";
 import type { AppEnv } from "../types.js";
 
@@ -56,6 +62,28 @@ export function authRoutes(db: DB) {
         defaultDriveId: null,
       });
     }
+  });
+
+  router.post("/reset-key", (c) => {
+    const user = c.get("user");
+    const orgs = listUserOrgs(db, user.id);
+
+    if (orgs.length === 0) {
+      // Defensive fallback: every user gets an auto-created personal org on
+      // registration, so this should not happen in practice. Without an
+      // orgId there is nowhere to attach the audit event, so skip it.
+      console.warn(`api key reset for user ${user.id} with no orgs; no audit event recorded`);
+      const { apiKey } = resetApiKeyOrgless(db, user.id);
+      return c.json({ apiKey });
+    }
+
+    const org = orgs.find((o) => o.isPersonal) ?? orgs[0];
+    const result = resetApiKey(db, {
+      userId: user.id,
+      actorId: user.id,
+      orgId: org.id,
+    });
+    return c.json({ apiKey: result.apiKey });
   });
 
   return router;

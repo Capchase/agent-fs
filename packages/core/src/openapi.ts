@@ -141,6 +141,106 @@ export function generateOpenAPISpec() {
           },
         },
       },
+      "/auth/reset-key": {
+        post: {
+          summary: "Reset your own API key",
+          description:
+            "Rotates the caller's API key. The old key stops working immediately. Records an api_key_reset audit event.",
+          operationId: "resetApiKey",
+          tags: ["Auth"],
+          responses: {
+            "200": {
+              description: "API key reset",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      apiKey: { type: "string" },
+                    },
+                    required: ["apiKey"],
+                  },
+                },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/orgs/{orgId}/members/{userId}/reset-key": {
+        post: {
+          summary: "Reset a member's API key (org admin only)",
+          description:
+            "Org admins can rotate a member's API key on their behalf, e.g. to recover a locked-out user. The old key stops working immediately. Records an api_key_reset audit event with the admin as actor.",
+          operationId: "resetMemberApiKey",
+          tags: ["Auth"],
+          parameters: [
+            {
+              name: "orgId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+              description: "Organization ID",
+            },
+            {
+              name: "userId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+              description: "ID of the member whose key to reset",
+            },
+          ],
+          responses: {
+            "200": {
+              description: "Member's API key reset",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      apiKey: { type: "string" },
+                      userId: { type: "string" },
+                      email: { type: "string" },
+                    },
+                    required: ["apiKey", "userId", "email"],
+                  },
+                },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "403": {
+              description: "Caller is not an org admin",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "404": {
+              description: "Org not found, or userId is not a member of the org",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
       "/orgs/{orgId}/ops": {
         post: {
           summary: "Dispatch a file operation",

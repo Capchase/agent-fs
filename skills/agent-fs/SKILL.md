@@ -6,7 +6,8 @@ description: >-
   "find that file", "store this document", "search agent-fs", "list my files",
   "show version history", "revert file", "set up agent-fs", "get a signed url",
   "share this file", "manage members", "invite user", "list members", "remove member",
-  "update role", file persistence for agents, shared agent filesystem, or any
+  "update role", "reset api key", "rotate api key", "lost my api key", file
+  persistence for agents, shared agent filesystem, or any
   mention of the agent-fs CLI. Also use when the user needs to manage drives,
   manage org/drive members, generate presigned URLs, check recent activity, or use
   semantic search across stored files. Also use when the user wants to run SQL
@@ -197,6 +198,7 @@ Supported formats: csv, tsv, parquet, xlsx, json, ndjson/jsonl (each also `.gz` 
 | `init` | `agent-fs init [--local] [-y]` | Alias for `onboard` |
 | `auth register` | `agent-fs auth register <email>` | Register a new user |
 | `auth whoami` | `agent-fs auth whoami` | Show current user info |
+| `auth reset-key` | `agent-fs auth reset-key` | Reset your own API key. The old key stops working immediately. |
 
 ### Member Management
 
@@ -206,6 +208,7 @@ Supported formats: csv, tsv, parquet, xlsx, json, ndjson/jsonl (each also `.gz` 
 | `member invite` | `agent-fs member invite <email> --role <role>` | Invite user to org (viewer/editor/admin) |
 | `member update-role` | `agent-fs member update-role <email> --role <role>` | Update org role (use `--drive <id>` for drive role) |
 | `member remove` | `agent-fs member remove <email>` | Remove from org (use `--drive <id>` for drive only) |
+| `member reset-key` | `agent-fs member reset-key <email>` | Reset a member's API key (org admin only). The old key stops working immediately. |
 
 The `--drive` flag is a global option — place it before the subcommand: `agent-fs --drive <id> member list`.
 
