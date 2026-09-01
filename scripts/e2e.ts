@@ -112,6 +112,16 @@ const testEnv = (): NodeJS.ProcessEnv => {
     AGENT_FS_DEFAULT_DRIVE_ID: "",
     AGENT_FS_SHARED_ORG_ID: "",
     BUCKET_NAME: "",
+    // Same story for API credentials: `run`/`runWithEnv` override these
+    // explicitly per-call, but `runRaw` (used by tests that deliberately
+    // exercise config-file-only auth resolution) does not — a stray
+    // AGENT_FS_API_KEY/AGENT_FS_API_URL from an agent-swarm worker's own
+    // real agent-fs account would otherwise leak through and point the CLI
+    // at production instead of this ephemeral test daemon. `undefined` (not
+    // "") so api-client.ts's `??` fallback to config still applies — an
+    // empty string is not nullish and would short-circuit it.
+    AGENT_FS_API_KEY: undefined,
+    AGENT_FS_API_URL: undefined,
   };
 
   if (localOnly) {
@@ -2118,6 +2128,111 @@ async function runStandardTests(daemonUrl: string) {
     // Clean up, then switch back to the personal org for the tests that follow.
     run("member remove reset-member@e2e.local");
     run(`org switch ${personalOrgId}`);
+  });
+
+  await test("self reset: auth reset-key --json returns structured output", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-json@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+
+    const out = runWithEnv("--json auth reset-key", { AGENT_FS_API_KEY: regData.apiKey });
+    const parsed = JSON.parse(out);
+    assert(typeof parsed.apiKey, "string", "Expected --json output to include an apiKey string");
+    assert(!out.includes("New API key:"), true, "Expected --json output to skip the plain-text banner");
+  });
+
+  await test("persisted-key path: auth reset-key updates the config field api-client reads", async () => {
+    // api-client.ts resolves `config.apiKey ?? config.auth.apiKey`. Simulate
+    // the dashboard-onboarding shape (only the top-level field populated) to
+    // reproduce the bug where a reset only updated auth.apiKey and left the
+    // client reading a stale, now-invalid top-level key.
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-persisted@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const configPath = join(testDir, "config.json");
+    const original = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(original);
+    config.apiKey = oldKey;
+    config.auth.apiKey = "";
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    try {
+      // No AGENT_FS_API_KEY override — relies entirely on persisted config,
+      // same as a real interactive session would.
+      const out = runRaw("auth reset-key");
+      assertIncludes(out, "New API key:");
+      const match = out.match(/New API key: (af_[0-9a-f]{64})/);
+      assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+      const newKey = match![1];
+      assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+      const updated = JSON.parse(readFileSync(configPath, "utf-8"));
+      assert(updated.apiKey, newKey, "Expected top-level config.apiKey to hold the fresh key");
+      assert(updated.auth.apiKey, newKey, "Expected config.auth.apiKey to hold the fresh key");
+
+      // A follow-up command relying purely on the persisted config (no env
+      // override) must authenticate with the new key, not 401 on the stale one.
+      const whoamiOut = runRaw("auth whoami");
+      assertIncludes(whoamiOut, "reset-persisted@e2e.local");
+    } finally {
+      writeFileSync(configPath, original);
+    }
+  });
+
+  await test("admin self-target reset: member reset-key <own email> persists the new key locally", async () => {
+    const regRes = await fetch(`${daemonUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "reset-admin-self@e2e.local" }),
+    });
+    assert(regRes.ok, true, `Expected 200, got ${regRes.status}`);
+    const regData = (await regRes.json()) as any;
+    const oldKey = regData.apiKey;
+
+    const configPath = join(testDir, "config.json");
+    const original = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(original);
+    config.auth.apiKey = oldKey;
+    delete config.apiKey;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    try {
+      // The freshly-registered user is admin of their own personal org, so
+      // targeting their own email exercises the admin self-reset path.
+      // --org pins the context explicitly: config.defaultOrg may still hold
+      // the primary test user's org from an earlier `org switch` test, which
+      // would misresolve getOrgId() for this different user/session.
+      const out = runRaw(`--org ${regData.orgId} member reset-key reset-admin-self@e2e.local`);
+      assertIncludes(out, "New API key for reset-admin-self@e2e.local:");
+      const match = out.match(/New API key for reset-admin-self@e2e\.local: (af_[0-9a-f]{64})/);
+      assert(!!match, true, `Expected printed key to match af_[0-9a-f]{64}, got: ${out}`);
+      const newKey = match![1];
+      assert(newKey !== oldKey, true, "Expected the new key to differ from the old key");
+
+      const updated = JSON.parse(readFileSync(configPath, "utf-8"));
+      assert(
+        updated.auth.apiKey,
+        newKey,
+        "Expected the admin's own reset to persist the fresh key to local config"
+      );
+
+      // A follow-up command relying purely on the persisted config must
+      // authenticate with the fresh key, not the invalidated old one.
+      const whoamiOut = runRaw("auth whoami");
+      assertIncludes(whoamiOut, "reset-admin-self@e2e.local");
+    } finally {
+      writeFileSync(configPath, original);
+    }
   });
 
   // Switch back and clean up config
