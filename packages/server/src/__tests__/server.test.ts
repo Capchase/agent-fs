@@ -561,3 +561,137 @@ describe("Multi-tenant RBAC", () => {
     expect(hiddenBody).toBe(missingBody);
   });
 });
+
+// --- API key reset routes ---
+
+describe("API key reset routes", () => {
+  function keyReq(key: string, path: string, opts?: RequestInit) {
+    const headers = new Headers(opts?.headers);
+    headers.set("Authorization", `Bearer ${key}`);
+    if (opts?.body) headers.set("Content-Type", "application/json");
+    return app.request(path, { ...opts, headers });
+  }
+
+  async function register(email: string) {
+    const res = await jsonPost("/auth/register", { email });
+    expect(res.status).toBe(200);
+    return res.json() as Promise<{ apiKey: string; userId: string; orgId: string }>;
+  }
+
+  test("self-reset returns a fresh key and invalidates the old one", async () => {
+    const user = await register("reset-self@example.com");
+
+    const resetRes = await keyReq(user.apiKey, "/auth/reset-key", { method: "POST" });
+    expect(resetRes.status).toBe(200);
+    const { apiKey: newKey } = await resetRes.json();
+    expect(newKey).toMatch(/^af_[0-9a-f]{64}$/);
+    expect(newKey).not.toBe(user.apiKey);
+
+    const oldKeyRes = await keyReq(user.apiKey, "/auth/me");
+    expect(oldKeyRes.status).toBe(401);
+
+    const newKeyRes = await keyReq(newKey, "/auth/me");
+    expect(newKeyRes.status).toBe(200);
+    expect((await newKeyRes.json()).email).toBe("reset-self@example.com");
+  });
+
+  test("admin reset by an org admin returns 200 and invalidates the member's old key", async () => {
+    const admin = await register("reset-admin@example.com");
+    const member = await register("reset-member@example.com");
+
+    const orgRes = await keyReq(admin.apiKey, "/orgs", {
+      method: "POST",
+      body: JSON.stringify({ name: "reset-org" }),
+    });
+    expect(orgRes.status).toBe(201);
+    const orgId = (await orgRes.json()).id;
+
+    const inviteRes = await keyReq(admin.apiKey, `/orgs/${orgId}/members/invite`, {
+      method: "POST",
+      body: JSON.stringify({ email: "reset-member@example.com", role: "viewer" }),
+    });
+    expect(inviteRes.status).toBe(200);
+
+    const resetRes = await keyReq(
+      admin.apiKey,
+      `/orgs/${orgId}/members/${member.userId}/reset-key`,
+      { method: "POST" }
+    );
+    expect(resetRes.status).toBe(200);
+    const body = await resetRes.json();
+    expect(body.apiKey).toMatch(/^af_[0-9a-f]{64}$/);
+    expect(body.userId).toBe(member.userId);
+    expect(body.email).toBe("reset-member@example.com");
+
+    expect((await keyReq(member.apiKey, "/auth/me")).status).toBe(401);
+    expect((await keyReq(body.apiKey, "/auth/me")).status).toBe(200);
+  });
+
+  test("a non-admin member gets 403 resetting another member's key", async () => {
+    const admin = await register("reset-nonadmin-admin@example.com");
+    const viewer = await register("reset-nonadmin-viewer@example.com");
+    const target = await register("reset-nonadmin-target@example.com");
+
+    const orgRes = await keyReq(admin.apiKey, "/orgs", {
+      method: "POST",
+      body: JSON.stringify({ name: "reset-nonadmin-org" }),
+    });
+    const orgId = (await orgRes.json()).id;
+
+    for (const email of ["reset-nonadmin-viewer@example.com", "reset-nonadmin-target@example.com"]) {
+      const res = await keyReq(admin.apiKey, `/orgs/${orgId}/members/invite`, {
+        method: "POST",
+        body: JSON.stringify({ email, role: "viewer" }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const resetRes = await keyReq(
+      viewer.apiKey,
+      `/orgs/${orgId}/members/${target.userId}/reset-key`,
+      { method: "POST" }
+    );
+    expect(resetRes.status).toBe(403);
+  });
+
+  test("a caller outside the org gets 404", async () => {
+    const admin = await register("reset-outside-admin@example.com");
+    const target = await register("reset-outside-target@example.com");
+    const outsider = await register("reset-outside-outsider@example.com");
+
+    const orgRes = await keyReq(admin.apiKey, "/orgs", {
+      method: "POST",
+      body: JSON.stringify({ name: "reset-outside-org" }),
+    });
+    const orgId = (await orgRes.json()).id;
+    await keyReq(admin.apiKey, `/orgs/${orgId}/members/invite`, {
+      method: "POST",
+      body: JSON.stringify({ email: "reset-outside-target@example.com", role: "viewer" }),
+    });
+
+    const resetRes = await keyReq(
+      outsider.apiKey,
+      `/orgs/${orgId}/members/${target.userId}/reset-key`,
+      { method: "POST" }
+    );
+    expect(resetRes.status).toBe(404);
+  });
+
+  test("an admin reset for a non-member userId gets 404", async () => {
+    const admin = await register("reset-nonmember-admin@example.com");
+    const stranger = await register("reset-nonmember-stranger@example.com");
+
+    const orgRes = await keyReq(admin.apiKey, "/orgs", {
+      method: "POST",
+      body: JSON.stringify({ name: "reset-nonmember-org" }),
+    });
+    const orgId = (await orgRes.json()).id;
+
+    const resetRes = await keyReq(
+      admin.apiKey,
+      `/orgs/${orgId}/members/${stranger.userId}/reset-key`,
+      { method: "POST" }
+    );
+    expect(resetRes.status).toBe(404);
+  });
+});

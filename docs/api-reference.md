@@ -37,13 +37,15 @@ curl http://localhost:7433/health
 
 ### `POST /auth/register`
 
-Register a new user. Returns user ID, org ID, drive ID, and API key.
+Register a new user. Returns user ID, org ID, drive ID, and API key. The key is shown only once — it isn't stored anywhere but the user's own `config.json`.
 
 ```bash
 curl -X POST http://localhost:7433/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email": "agent@example.com"}'
 ```
+
+`agent-fs auth reset-key` rotates your own key while you still hold the current one — it calls `/auth/reset-key`, which sits behind the same auth middleware as every other endpoint, so it cannot help if the key is genuinely lost. Recovering a lost key requires an org admin to run `agent-fs member reset-key <email>` on the locked-out user's behalf. Either path invalidates the old key immediately.
 
 ### `GET /auth/me`
 

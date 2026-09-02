@@ -102,7 +102,12 @@ try {
     s3,
     embeddingProvider,
     appUrl: config.appUrl,
-    resolveApiKey: () => config.auth?.apiKey ?? null,
+    // Reread the persisted config on every call rather than closing over the
+    // startup `config` const above: a self-reset (`auth reset-key`) rewrites
+    // config.json in place, and getConfig() has no cache, so this keeps
+    // in-flight and newly-mounted FUSE connections authenticated without a
+    // daemon restart.
+    resolveApiKey: () => getConfig().auth?.apiKey ?? null,
   });
   console.log(`agent-fs IPC listening on ${socketPath}`);
 } catch (err) {
