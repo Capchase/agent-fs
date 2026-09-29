@@ -71,6 +71,10 @@ export interface DiffChange {
   type: "add" | "remove" | "context"
   content: string
   lineNumber?: number
+  /** 1-based line in v1; absent on servers that predate line numbers. */
+  oldLine?: number
+  /** 1-based line in v2; absent on servers that predate line numbers. */
+  newLine?: number
 }
 
 export interface DiffResult {
@@ -97,6 +101,12 @@ export interface GlobResult {
 
 // Comment types
 
+export interface CommentQuote {
+  exact: string
+  prefix?: string
+  suffix?: string
+}
+
 export interface CommentEntry {
   id: string
   parentId?: string
@@ -104,6 +114,7 @@ export interface CommentEntry {
   lineStart?: number
   lineEnd?: number
   quotedContent?: string
+  quote?: CommentQuote
   body: string
   author: string
   authorDisplayName?: string
@@ -111,6 +122,8 @@ export interface CommentEntry {
   resolvedBy?: string
   resolvedAt?: string
   fileVersionId?: number
+  /** Version number of fileVersionId; absent on older servers. */
+  fileVersion?: number
   replyCount: number
   createdAt: string
   updatedAt: string

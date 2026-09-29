@@ -47,8 +47,8 @@ export function FileDetailPage() {
     queueMicrotask(() => uiChromeStore.setLeft(false))
   }, [])
 
-  const handleCommentClick = useCallback((lineStart?: number, _lineEnd?: number, quotedContent?: string) => {
-    scrollToCommentRef.current?.({ lineStart, quotedContent })
+  const handleCommentClick = useCallback((lineStart?: number, _lineEnd?: number, quotedContent?: string, commentId?: string) => {
+    scrollToCommentRef.current?.({ lineStart, quotedContent, commentId })
   }, [])
 
   if (!filePath) {
