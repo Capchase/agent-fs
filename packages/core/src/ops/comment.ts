@@ -19,6 +19,7 @@ import type {
   CommentQuote,
 } from "./types.js";
 import { NotFoundError, ValidationError, PermissionDeniedError } from "../errors.js";
+import { normalizePrefix } from "./paths.js";
 
 // --- Event helper ---
 
@@ -153,7 +154,8 @@ function toCommentEntry(row: any): CommentEntry {
   };
 }
 
-// Only display names leave this lookup. Membership roles and emails remain private.
+// This lookup adds display names to comments. Member emails are available through
+// drive-members, while membership roles remain private to admin surfaces.
 function addAuthorNames<T extends { author: string; authorDisplayName?: string }>(ctx: OpContext, entries: T[]): T[] {
   const ids = [...new Set(entries.map((entry) => entry.author))];
   if (!ids.length) return entries;
@@ -297,6 +299,21 @@ export async function commentList(
 
   if (params.path) {
     conditions.push(eq(schema.comments.path, params.path));
+  }
+
+  if (params.pathPrefix !== undefined) {
+    const prefix = normalizePrefix(params.pathPrefix);
+    if (prefix !== "/") {
+      const relativePrefix = prefix.slice(1);
+      // "0" is the BINARY-collation upper bound after a trailing "/".
+      const prefixUpper = prefix.slice(0, -1) + "0";
+      const relativePrefixUpper = relativePrefix.slice(0, -1) + "0";
+      conditions.push(sql`(
+        (${schema.comments.path} >= ${prefix} AND ${schema.comments.path} < ${prefixUpper})
+        OR
+        (${schema.comments.path} >= ${relativePrefix} AND ${schema.comments.path} < ${relativePrefixUpper})
+      )`);
+    }
   }
 
   if (params.parentId) {
