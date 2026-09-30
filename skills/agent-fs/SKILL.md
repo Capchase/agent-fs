@@ -106,7 +106,7 @@ symlinks are unsupported and throw `EPERM`.
    agent-fs write assets/screenshot.png --file ./screenshot.png
    ```
 
-5. **Paths** — forward-slash separated, no leading slash required. Example: `docs/notes/meeting.md`
+5. **Paths**: use forward slashes. A leading slash is optional. Agent FS returns and stores the canonical form, such as `/docs/notes/meeting.md`.
 
 6. **Version messages** — optional but recommended for auditability:
    ```bash
