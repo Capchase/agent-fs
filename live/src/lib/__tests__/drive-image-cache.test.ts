@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { DriveImageCache, type DriveImageResolution } from "../drive-image-cache"
 
 const RES: DriveImageResolution = {
@@ -43,5 +43,35 @@ describe("DriveImageCache", () => {
     cache.set("client-a", RES, { url: "https://signed.example.com/b", expiresAt: Date.now() + 1000 })
 
     expect(cache.getFresh("client-a", RES)).toBeNull()
+  })
+
+  test("delete revokes an object URL the cache owns, and only that", () => {
+    const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {})
+    try {
+      const cache = new DriveImageCache()
+      cache.set("client-a", RES, { url: "blob:owned", expiresAt: Date.now() + 60 * 60 * 1000, objectUrl: true })
+      cache.set("client-b", RES, FRESH_ENTRY)
+
+      cache.delete("client-a", RES)
+      cache.delete("client-b", RES)
+
+      expect(revoke).toHaveBeenCalledTimes(1)
+      expect(revoke).toHaveBeenCalledWith("blob:owned")
+    } finally {
+      revoke.mockRestore()
+    }
+  })
+
+  test("replacing an object URL entry does not revoke it", () => {
+    const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {})
+    try {
+      const cache = new DriveImageCache()
+      cache.set("client-a", RES, { url: "blob:old", expiresAt: Date.now() + 1000, objectUrl: true })
+      cache.set("client-a", RES, { url: "blob:new", expiresAt: Date.now() + 60 * 60 * 1000, objectUrl: true })
+
+      expect(revoke).not.toHaveBeenCalled()
+    } finally {
+      revoke.mockRestore()
+    }
   })
 })

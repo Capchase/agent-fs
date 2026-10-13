@@ -14,6 +14,8 @@ export interface DriveImageCacheEntry {
   url: string
   /** Epoch ms; `Infinity` for a non-expiring entry. */
   expiresAt: number
+  /** `url` is an object URL this cache owns and revokes on `delete`. */
+  objectUrl?: boolean
 }
 
 export const MIN_FRESH_MS = 5 * 60 * 1000
@@ -44,8 +46,15 @@ export class DriveImageCache {
     this.entries.set(this.key(clientId, res), value)
   }
 
+  /**
+   * Revokes an owned object URL. A replaced entry is not revoked: an image
+   * still mounted elsewhere can reopen it (lightbox, download).
+   */
   delete(clientId: string, res: DriveImageResolution): void {
-    this.entries.delete(this.key(clientId, res))
+    const key = this.key(clientId, res)
+    const cached = this.entries.get(key)
+    if (cached && !(cached instanceof Promise) && cached.objectUrl) URL.revokeObjectURL(cached.url)
+    this.entries.delete(key)
   }
 }
 

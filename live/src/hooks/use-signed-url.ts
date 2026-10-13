@@ -1,7 +1,15 @@
 import { useState, useEffect, useCallback } from "react"
 import { useAuth } from "@/contexts/auth"
 import type { AgentFsClient, SignedUrlDisposition } from "@/api/client"
-import { driveImageCache, type DriveImageResolution, type DriveImageCacheEntry } from "@/lib/drive-image-cache"
+import {
+  MIN_FRESH_MS,
+  driveImageCache,
+  type DriveImageResolution,
+  type DriveImageCacheEntry,
+} from "@/lib/drive-image-cache"
+
+/** Object URLs stay fresh for `MIN_FRESH_MS`, then the next open re-reads the image. */
+const OBJECT_URL_TTL_MS = 2 * MIN_FRESH_MS
 
 /**
  * @param disposition `inline` for URLs the browser must render (PDF iframe);
@@ -21,10 +29,11 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
 
     let cancelled = false
     let objectUrl: string | null = null
+    const controller = new AbortController()
     setIsLoading(true)
     setError(null)
 
-    client.fetchableUrl(orgId, driveId, path, { disposition }).then((result) => {
+    client.fetchableUrl(orgId, driveId, path, { disposition, signal: controller.signal }).then((result) => {
       if (result.objectUrl) objectUrl = result.url
       if (cancelled) {
         if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -41,6 +50,7 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
 
     return () => {
       cancelled = true
+      controller.abort()
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }, [path, orgId, driveId, client, disposition])
@@ -51,8 +61,8 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
 export type { DriveImageResolution }
 
 async function mintDriveImageUrl(client: AgentFsClient, res: DriveImageResolution): Promise<DriveImageCacheEntry> {
-  // Object URLs are not revoked: the cache shares them across every render of the image.
   const result = await client.fetchableUrl(res.orgId, res.driveId, res.path)
+  if (result.objectUrl) return { url: result.url, expiresAt: Date.now() + OBJECT_URL_TTL_MS, objectUrl: true }
   return {
     url: result.url,
     expiresAt: result.expiresAt ? new Date(result.expiresAt).getTime() : Infinity,
