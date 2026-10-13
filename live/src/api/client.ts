@@ -309,12 +309,35 @@ export class AgentFsClient {
     return `${this.endpoint}/orgs/${orgId}/drives/${driveId}/files/${encodeURIComponent(path)}/raw`
   }
 
-  async fetchRaw(orgId: string, driveId: string, path: string): Promise<Blob> {
+  async fetchRawResponse(orgId: string, driveId: string, path: string, init?: RequestInit): Promise<Response> {
     const url = this.getRawUrl(orgId, driveId, path)
     const res = await fetch(url, {
+      ...init,
       headers: { Authorization: `Bearer ${this.apiKey}` },
     })
     if (!res.ok) throw new Error(`Failed to fetch raw: ${res.statusText}`)
-    return res.blob()
+    return res
+  }
+
+  async fetchRaw(orgId: string, driveId: string, path: string): Promise<Blob> {
+    return (await this.fetchRawResponse(orgId, driveId, path)).blob()
+  }
+
+  /**
+   * A URL the browser can load for `path`. Backends without presigned URLs
+   * answer `signed-url` with an `app` link, which is the viewer page rather
+   * than the bytes; those are read through the authenticated raw route into
+   * an object URL that the caller must revoke.
+   */
+  async fetchableUrl(
+    orgId: string,
+    driveId: string,
+    path: string,
+    options?: { disposition?: SignedUrlDisposition },
+  ): Promise<{ url: string; expiresAt: string; objectUrl: boolean }> {
+    const result = await this.getSignedUrl(orgId, driveId, path, options)
+    if (result.kind !== "app") return { url: result.url, expiresAt: result.expiresAt, objectUrl: false }
+    const blob = await this.fetchRaw(orgId, driveId, path)
+    return { url: URL.createObjectURL(blob), expiresAt: "", objectUrl: true }
   }
 }

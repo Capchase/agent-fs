@@ -20,14 +20,18 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
     }
 
     let cancelled = false
+    let objectUrl: string | null = null
     setIsLoading(true)
     setError(null)
 
-    client.getSignedUrl(orgId, driveId, path, { disposition }).then((result) => {
-      if (!cancelled) {
-        setUrl(result.url)
-        setIsLoading(false)
+    client.fetchableUrl(orgId, driveId, path, { disposition }).then((result) => {
+      if (result.objectUrl) objectUrl = result.url
+      if (cancelled) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl)
+        return
       }
+      setUrl(result.url)
+      setIsLoading(false)
     }).catch((err) => {
       if (!cancelled) {
         setError((err as Error).message)
@@ -35,7 +39,10 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
       }
     })
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
   }, [path, orgId, driveId, client, disposition])
 
   return { url, error, isLoading }
@@ -44,10 +51,8 @@ export function useSignedUrl(path: string | null, disposition?: SignedUrlDisposi
 export type { DriveImageResolution }
 
 async function mintDriveImageUrl(client: AgentFsClient, res: DriveImageResolution): Promise<DriveImageCacheEntry> {
-  const result = await client.getSignedUrl(res.orgId, res.driveId, res.path)
-  if (result.kind === "app") {
-    throw new Error("this backend cannot mint public image URLs")
-  }
+  // Object URLs are not revoked: the cache shares them across every render of the image.
+  const result = await client.fetchableUrl(res.orgId, res.driveId, res.path)
   return {
     url: result.url,
     expiresAt: result.expiresAt ? new Date(result.expiresAt).getTime() : Infinity,
