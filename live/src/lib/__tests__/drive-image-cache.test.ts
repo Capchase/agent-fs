@@ -45,33 +45,68 @@ describe("DriveImageCache", () => {
     expect(cache.getFresh("client-a", RES)).toBeNull()
   })
 
-  test("delete revokes an object URL the cache owns, and only that", () => {
-    const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {})
+  const owned = (url: string) => ({ url, expiresAt: Date.now() + 60 * 60 * 1000, objectUrl: true })
+
+  function withRevokeSpy(run: (revoked: string[]) => void) {
+    const revoked: string[] = []
+    const spy = spyOn(URL, "revokeObjectURL").mockImplementation((url: string) => void revoked.push(url))
     try {
+      run(revoked)
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  test("delete revokes an unheld object URL the cache owns, never a signed URL", () => {
+    withRevokeSpy((revoked) => {
       const cache = new DriveImageCache()
-      cache.set("client-a", RES, { url: "blob:owned", expiresAt: Date.now() + 60 * 60 * 1000, objectUrl: true })
+      cache.set("client-a", RES, owned("blob:owned"))
       cache.set("client-b", RES, FRESH_ENTRY)
 
       cache.delete("client-a", RES)
       cache.delete("client-b", RES)
 
-      expect(revoke).toHaveBeenCalledTimes(1)
-      expect(revoke).toHaveBeenCalledWith("blob:owned")
-    } finally {
-      revoke.mockRestore()
-    }
+      expect(revoked).toEqual(["blob:owned"])
+    })
   })
 
-  test("replacing an object URL entry does not revoke it", () => {
-    const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {})
-    try {
+  test("replacing an unheld object URL revokes it; re-setting the same URL does not", () => {
+    withRevokeSpy((revoked) => {
       const cache = new DriveImageCache()
-      cache.set("client-a", RES, { url: "blob:old", expiresAt: Date.now() + 1000, objectUrl: true })
-      cache.set("client-a", RES, { url: "blob:new", expiresAt: Date.now() + 60 * 60 * 1000, objectUrl: true })
+      cache.set("client-a", RES, owned("blob:old"))
+      cache.set("client-a", RES, owned("blob:old"))
+      expect(revoked).toEqual([])
 
-      expect(revoke).not.toHaveBeenCalled()
-    } finally {
-      revoke.mockRestore()
-    }
+      cache.set("client-a", RES, owned("blob:new"))
+      expect(revoked).toEqual(["blob:old"])
+    })
+  })
+
+  test("a replaced object URL stays alive until its last holder releases it", () => {
+    withRevokeSpy((revoked) => {
+      const cache = new DriveImageCache()
+      cache.set("client-a", RES, owned("blob:old"))
+      cache.hold("blob:old")
+      cache.hold("blob:old")
+
+      cache.set("client-a", RES, Promise.resolve(owned("blob:new")))
+      cache.release("blob:old")
+      expect(revoked).toEqual([])
+
+      cache.release("blob:old")
+      expect(revoked).toEqual(["blob:old"])
+    })
+  })
+
+  test("releasing a URL that is still cached does not revoke it", () => {
+    withRevokeSpy((revoked) => {
+      const cache = new DriveImageCache()
+      cache.set("client-a", RES, owned("blob:live"))
+      cache.hold("blob:live")
+      cache.release("blob:live")
+
+      expect(revoked).toEqual([])
+      expect(cache.getFresh("client-a", RES)?.url).toBe("blob:live")
+    })
   })
 })

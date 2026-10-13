@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { AgentFsClient } from "../client"
+import { AgentFsClient } from "../../api/client"
 
 const realFetch = globalThis.fetch
 afterEach(() => {

@@ -92,12 +92,22 @@ export function useDriveImageUrl(res: DriveImageResolution | null) {
 
     const cached = driveImageCache.getFresh(clientId, res)
     let cancelled = false
-
-    if (cached) {
-      setUrl(cached.url)
+    let held: string | null = null
+    const show = (shown: string) => {
+      driveImageCache.hold(shown)
+      held = shown
+      setUrl(shown)
       setError(null)
       setIsLoading(false)
-      return
+    }
+    const cleanup = () => {
+      cancelled = true
+      if (held) driveImageCache.release(held)
+    }
+
+    if (cached) {
+      show(cached.url)
+      return cleanup
     }
 
     setIsLoading(true)
@@ -108,10 +118,7 @@ export function useDriveImageUrl(res: DriveImageResolution | null) {
     driveImageCache.set(clientId, res, pending)
     pending.then((entry) => {
       driveImageCache.set(clientId, res, entry)
-      if (cancelled) return
-      setUrl(entry.url)
-      setError(null)
-      setIsLoading(false)
+      if (!cancelled) show(entry.url)
     }).catch((err: unknown) => {
       driveImageCache.delete(clientId, res)
       if (cancelled) return
@@ -119,7 +126,7 @@ export function useDriveImageUrl(res: DriveImageResolution | null) {
       setIsLoading(false)
     })
 
-    return () => { cancelled = true }
+    return cleanup
   }, [res?.orgId, res?.driveId, res?.path, client, clientId, nonce])
 
   // Drops the cached entry and re-mints — used for the single-retry-on-load-error path.
