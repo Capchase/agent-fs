@@ -1,6 +1,6 @@
 {
   "name": "agent-fs",
-  "version": "0.17.3",
+  "version": "0.17.4",
   "packageManager": "bun@1.4.1",
   "private": true,
   "workspaces": [
@@ -16,7 +16,8 @@
     "deploy:fly": "fly deploy -a agent-fs-taras"
   },
   "dependencies": {
-    "@huggingface/transformers": "4.3.1"
+    "@huggingface/transformers": "4.3.1",
+    "@napi-rs/canvas": "1.0.11"
   },
   "devDependencies": {
     "@duckdb/node-api": "1.5.3-r.3",
