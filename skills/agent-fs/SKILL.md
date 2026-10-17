@@ -187,13 +187,17 @@ With EmbeddingGemma 2, semantic search also finds PNG, JPEG, WebP, GIF, and the 
 Results carry `kind: "text"` or `kind: "image"` for semantic matches.
 Image matches use `[image]` snippets. PDF page images use `[PDF page N]` snippets and carry `page`.
 Search still returns one result per file. The best semantic chunk determines `kind` and `page`.
+Hybrid search doubles an image's vector contribution only when cosine similarity reaches 0.69 and FTS misses the file.
+Lower similarities keep one vector contribution. An FTS match still adds its keyword contribution.
 Image indexing runs in the background, so a new image can take time to appear.
 Use `agent-fs signed-url <path> --inline` to view the file, or omit `--inline` to download it.
 On a local-filesystem backend, the URL requires an authenticated drive member.
 Semantic results require embeddings. `vec-search` returns a hint when no provider exists, and `search` identifies keyword-only results.
-For local semantic search, set `EMBEDDING_PROVIDER=local` and `EMBEDDING_MODEL=embeddinggemma-2` to select EmbeddingGemma 2. An empty model setting keeps nomic as the default.
+For local semantic search, set `EMBEDDING_PROVIDER=local` and `EMBEDDING_MODEL=embeddinggemma-2` to select EmbeddingGemma 2.
+With an empty model setting, fresh indexes use EmbeddingGemma 2 when transformers 4.3.1 loads locally. Otherwise, they use nomic.
+Existing nomic indexes stay on nomic. Set `EMBEDDING_MODEL=nomic-embed-text-v1.5` to select nomic explicitly.
 
-`vec-search` scores are cosine similarity. With the local model, a good match scores about 0.6 or more, and an unrelated file scores about 0.3 to 0.5. Every query returns its nearest files, so read the score before you trust a result. Hybrid `search` scores are ranks, scaled to 0 to 1: 1 means first in both the keyword and the semantic list, 0.5 first in one of them. All three search ops return `tookMs`, the server time for the query. If the embedding provider returns an unusable vector, `search` and `vec-search` fail with `EMBEDDING_PROVIDER_ERROR` (HTTP 502). Check the provider configuration, then try again.
+`vec-search` scores are cosine similarity. The score scale depends on the model. A good match with nomic scores about 0.6. Ranking matters more than the absolute score. Every query returns its nearest files, so check their relevance before you trust a result. Hybrid `search` scores are ranks, scaled to 0 to 1: 1 means first in every list that can match the file. All three search ops return `tookMs`, the server time for the query. If the embedding provider returns an unusable vector, `search` and `vec-search` fail with `EMBEDDING_PROVIDER_ERROR` (HTTP 502). Check the provider configuration, then try again.
 
 `fts` accepts raw FTS5 syntax. Quote punctuation-bearing terms with FTS double quotes inside shell single quotes:
 
@@ -282,7 +286,7 @@ Drive membership is explicit: `drive list` shows only drives you're a member of.
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `config get` | `agent-fs config get <key>` | Get config value (dot notation: `s3.bucket`) |
-| `config set` | `agent-fs config set <key> <value>` | Set config value |
+| `config set` | `agent-fs config set <key> <value>` | Set config value. Changing `embedding.provider` removes the old model and API key. |
 | `config list` | `agent-fs config list` | Show all configuration |
 | `config validate` | `agent-fs config validate` | Check S3, database, auth, embeddings health |
 | `daemon start` | `agent-fs daemon start` | Start the background daemon |

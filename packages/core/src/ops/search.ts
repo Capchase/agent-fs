@@ -1,8 +1,12 @@
 import type { OpContext } from "./types.js";
 import { ftsQuery } from "../search/fts.js";
 import { findVectorCandidates } from "../search/vector-candidates.js";
-import { toUnitVector } from "../search/vectors.js";
+import { similarityFromDistance, toUnitVector } from "../search/vectors.js";
 import type { ChunkKind } from "../search/pipeline.js";
+
+// Cosine floor calibrated on EmbeddingGemma 2, the only provider that stores image vectors.
+// Relevant p10: 0.702, unrelated p90: 0.648. Keeps 19/20 relevant pairs.
+const MIN_IMAGE_BOOST_SIMILARITY = 0.69;
 
 export interface SearchParams {
   query: string;
@@ -37,11 +41,14 @@ export async function search(
   const started = performance.now();
   const limit = params.limit ?? 10;
   const provider = ctx.embeddingProvider;
+  // The default limit 10 times 3 preserves today's pool. Limits up to 30 share the same order.
+  const MIN_CANDIDATE_POOL = 30;
+  const pool = Math.max(limit, MIN_CANDIDATE_POOL);
 
   // Run vector search and FTS in parallel
   const [vecResults, ftsResults] = await Promise.all([
-    provider ? vectorSearch(ctx, params.query, limit * 3) : [],
-    keywordSearch(ctx, params.query, limit * 3),
+    provider ? vectorSearch(ctx, params.query, pool) : [],
+    keywordSearch(ctx, params.query, pool),
   ]);
 
   if (vecResults.length === 0 && ftsResults.length === 0) {
@@ -58,7 +65,7 @@ export async function search(
   const K = 60;
   const merged = new Map<
     string,
-    { score: number; snippet: string; page?: number; kind?: ChunkKind; author?: string; modifiedAt?: Date }
+    { score: number; snippet: string; ftsHit?: boolean; similarity?: number; page?: number; kind?: ChunkKind; author?: string; modifiedAt?: Date }
   >();
 
   // Score vector results by rank position
@@ -72,6 +79,7 @@ export async function search(
       merged.set(item.path, {
         score: rrfScore,
         snippet: item.snippet,
+        similarity: item.similarity,
         page: item.page,
         kind: item.kind,
         author: item.author,
@@ -87,6 +95,7 @@ export async function search(
     const existing = merged.get(item.path);
     if (existing) {
       existing.score += rrfScore;
+      existing.ftsHit = true;
       // Prefer FTS snippet (has keyword highlighting)
       if (item.snippet && existing.kind !== "image") {
         existing.snippet = item.snippet;
@@ -95,13 +104,22 @@ export async function search(
       merged.set(item.path, {
         score: rrfScore,
         snippet: item.snippet,
+        kind: "text",
+        ftsHit: true,
       });
+    }
+  }
+
+  // Count a sufficiently similar image's vector rank for both lists when FTS misses.
+  if (provider) {
+    for (const data of merged.values()) {
+      if (data.kind === "image" && !data.ftsHit && (data.similarity ?? 0) >= MIN_IMAGE_BOOST_SIMILARITY) data.score *= 2;
     }
   }
 
   // Sort by combined RRF score, take top N. The raw sum is at most
   // lists / (K + 1), about 0.033, so it is scaled to 0..1: 1 means first in
-  // every list that ran, 0.5 first in one of two.
+  // every list that can match the file.
   const maxScore = (provider ? 2 : 1) / (K + 1);
   const results: SearchResultItem[] = Array.from(merged.entries())
     .sort(([, a], [, b]) => b.score - a.score)
@@ -144,7 +162,7 @@ async function vectorSearch(
   ctx: OpContext,
   query: string,
   limit: number
-): Promise<RankedItem[]> {
+): Promise<(RankedItem & { similarity: number })[]> {
   const provider = ctx.embeddingProvider!;
   const queryEmbedding = await provider.embedQuery(query);
   const queryVec = toUnitVector(queryEmbedding, provider.dimensions);
@@ -152,6 +170,7 @@ async function vectorSearch(
   return (await findVectorCandidates(ctx.db, ctx.driveId, queryVec, limit)).map(
     (candidate) => ({
       path: candidate.path,
+      similarity: similarityFromDistance(candidate.distance),
       snippet: candidate.snippet,
       page: candidate.page,
       kind: candidate.kind,

@@ -960,27 +960,127 @@ Deliverable: with `EMBEDDING_PROVIDER=local` (or unset) and an empty `EMBEDDING_
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Typecheck passes: `bun run typecheck`
-- [ ] Unit tests pass: `bun run test`
-- [ ] Build passes: `bun run build`
-- [ ] E2E local mode passes (E2E still forces `openai` with empty keys, so no download): `bun run scripts/e2e.ts "bun run packages/cli/src/index.ts --" --local-only`
-- [ ] Full E2E passes: `bun run scripts/e2e.ts "bun run packages/cli/src/index.ts --"`
-- [ ] Lockfile and versions are clean before release: `bun install --frozen-lockfile && bun run scripts/sync-versions.ts --check`
+- [x] Typecheck passes: `bun run typecheck`
+- [x] Unit tests pass: `bun run test`
+  - Result: 1570 pass, 61 skip, 0 fail.
+- [x] Build passes: `bun run build`
+- [x] E2E local mode passes (E2E still forces `openai` with empty keys, so no download): `bun run scripts/e2e.ts "bun run packages/cli/src/index.ts --" --local-only`
+  - Result: 187/187 passed, 20 skipped.
+- [x] Full E2E passes: `bun run scripts/e2e.ts "bun run packages/cli/src/index.ts --"`
+  - Result: 208/209 passed. The one failure is the known `share-create returns a public link on the API host`.
+- [x] Lockfile and versions are clean before release: `bun install --frozen-lockfile && bun run scripts/sync-versions.ts --check`
+  - Result: lockfile clean, all targets at 0.17.5 before the release.
 - [ ] Versions in sync after release: `bun run scripts/sync-versions.ts --check`
 
 #### Automated QA:
-- [ ] Fresh index: start a daemon with `AGENT_FS_HOME=/tmp/eg2-plan/p7-fresh`, `models` symlinked to `/tmp/eg2-plan/tjs-cache`, and `EMBEDDING_PROVIDER=local`. The boot log names `embeddinggemma-2` with reason "fresh index".
-- [ ] Sticky index: copy a nomic-built home (`local:v3`, with chunks) to `/tmp/eg2-plan/p7-sticky` and start a daemon on it. The boot log names `nomic-embed-text-v1.5` with reason "index built by nomic", and no re-embed starts.
-- [ ] Sticky index without a stored format (as 0.16.4 and older left it):
+- [x] Fresh index: start a daemon with `AGENT_FS_HOME=/tmp/eg2-plan/p7-fresh`, `models` symlinked to `/tmp/eg2-plan/tjs-cache`, and `EMBEDDING_PROVIDER=local`. The boot log names `embeddinggemma-2` with reason "fresh index".
+  - Result: `[agent-fs] local embedding model: embeddinggemma-2 (fresh index)`. One file `indexed`, format `embeddinggemma:v2`.
+- [x] Sticky index: copy a nomic-built home (`local:v3`, with chunks) to `/tmp/eg2-plan/p7-sticky` and start a daemon on it. The boot log names `nomic-embed-text-v1.5` with reason "index built by nomic", and no re-embed starts.
+  - Result: `nomic-embed-text-v1.5 (index built by nomic)`. No `embedding migration` line, no model load at boot, statuses and `local:v3` unchanged.
+- [x] Sticky index without a stored format (as 0.16.4 and older left it):
+  - Result: `nomic-embed-text-v1.5 (index built by nomic)`, then one nomic re-embed (3 files), format `local:v3`. Only the nomic gguf is read (see the decision below).
   - Copy the nomic home and delete the `embedding_format` row from `meta` in the copy.
   - Start a daemon on it. The boot log names `nomic-embed-text-v1.5`, and no re-embed starts.
+  - Decision (2026-10-17): a missing format means vectors from 0.16.4 or older. Those are not unit length (format keys came with unit vectors in 0.16.5), so the existing migration re-embeds them once with nomic and stores `local:v3`. That is correct. The pass condition is: the boot log names nomic, one nomic re-embed runs, `embedding_format` ends `local:v3`, and no EmbeddingGemma file is read.
 - [ ] After merge: prod `/health` returns `0.18.0`. `fly logs --no-tail` returns only a short buffer, so watch `fly logs -a agent-fs-taras` live during the deploy. No `embedding migration` line appears within 10 min of the deploy.
 
 #### Manual Verification:
-- [ ] Before this PR merges: 0.17.4 runs on the swarm (Manual E2E §3, first run), and the Appendix multimodal column is filled.
+- [x] Before this PR merges: 0.17.4 runs on the swarm (Manual E2E §3, first run), and the Appendix multimodal column is filled. **Waived by Taras (2026-10-17)**: his local test with 90 files from ~/Downloads and the additions QA cover the same checks on real data. The swarm measurements can run later.
 - [ ] Taras confirms the upgrade note reads clearly for self-hosters.
 
+**Review changes (2026-10-17)**: the resolver probes transformers only on the branches that need it (not for a configured model or a sticky nomic index). A stored EmbeddingGemma 2 index whose transformers cannot load keeps its model and format, and the boot line carries the cause plus the install hint (checked with a preload that blocks the import). Chunks from another provider give the reason "index built by another provider". `.env.example`, README and the docs say local runs nomic on llama.cpp or EmbeddingGemma 2 on transformers.js.
+
+**Follow-up fix (2026-10-17)**: the model and API key in config.json belong to the provider in config.json. When `EMBEDDING_PROVIDER` names another provider, the config loader drops them (an onboarded OpenAI config with `EMBEDDING_PROVIDER=local` no longer turns semantic search off). `config set embedding.provider` clears them on a change, and `setConfig`/`setConfigValue` no longer write env values to config.json.
+
+### Phase 7 additions (2026-10-17, from the local test)
+
+Taras's local test (90 files from ~/Downloads, memo `/tmp/eg2-plan/local-findings.md`) found four problems. Taras chose to fix them in #105, before the default flip.
+
+1. **EmbeddingGemma 2 off the main thread.** onnxruntime-node runs `session.run` and session creation synchronously. Every text chunk (about 1.7 s) and every image held the event loop. GC and vision reloads stalled it for 5 to 10.8 s (9 watchdog stalls, 28 SLOW requests, PDF writes up to 43 s). Run the text and vision models and PDF page rendering in a Bun Worker. The `EmbeddingProvider` interface does not change. Queries go ahead of document work. A dead worker rejects its pending calls, and the next call starts a new worker. The main thread creates and runs no onnxruntime session.
+2. **Hybrid image scoring.** FTS never indexes images, so RRF gave an image only the vector term (at most 0.5). Every file in both lists ranked above the best image. An `image` entry that FTS did not hit now scores on the vector list alone (its term counts twice). Text-only drives do not change.
+3. **Fixed candidate pool.** Both lists asked for `limit * 3` files, so the hybrid order changed with `--limit`. Use `Math.max(limit, 30)` for both lists. Limits up to 30 then give the same order, and the default limit 10 keeps today's pool.
+4. **`kind` on keyword-only hits.** FTS-only hybrid entries get `kind: "text"`.
+
+Not in scope: batching text chunks (after the worker, measure first), the shared 2-slot semaphore that starves the image job, PDF text extraction in the PUT path.
+
+- [x] `bun run typecheck`, `bun run test`, `bun run build` pass
+- [x] `AGENT_FS_TEST_EMBEDDINGGEMMA_HOME=/tmp/eg2-plan/p2-home bun test packages/core/src/__manual_tests__/embeddinggemma.test.ts` passes through the worker
+- [x] E2E `--local-only` and full (MinIO) pass, except the known `share-create` failure
+- [x] Unit tests: an image at vector rank 1 ranks first over text files in both lists, a text-only drive keeps its scores, `--limit 3` gives the first 3 of `--limit 30`, FTS-only hits carry `kind: "text"`
+
+- [x] No watchdog stall. `/health` polled every 200 ms answers within 1 s for the whole prefill (before: 9 stalls of 5 to 10.8 s)
+- [x] PDF writes finish in a few seconds (before: up to 43 s)
+- [x] Hybrid: "GitHub octocat logo", "presentation slide about AI event" and "Ramp logo" put the target image in the top 2 (before: ranks 8, 19 and 4)
+- [x] Boot line still `embeddinggemma-2 (fresh index)`, and peak RSS is no worse than 3.3 GB
+- [x] Docker smoke (the image, a fresh volume, `EMBEDDING_PROVIDER=local`): `Model ready`, one `.md`, one PNG and one PDF write, a `kind: image` hit and a PDF page hit. The worker loads onnxruntime, sharp and `@napi-rs/canvas` on Linux
+
+QA result (2026-10-17, commit 9dde873, `/tmp/eg2-plan/p7w-qa-run/`): 0 watchdog stalls (before 9), 0 SLOW lines (before 28), 12,561 `/health` polls with max 962 ms and p99 23 ms, slowest PDF write 1.16 s (before 43 s), upload of 90 files 27 s (before 732 s), peak RSS 2287 MB (before 3323 MB), all 3 target images at rank 1 with `--limit 3` and `--limit 30`. Total indexing stays about 42 min, because the image job waits behind text work (the 2-slot semaphore, out of scope). Docker smoke on linux/arm64 with a 2 GB limit: peak 1.29 GiB, `/health` max 95 ms. E2E: 187/187 local-only, 208/209 full (the known `share-create` failure). Open: amd64 not tested, and `/health` slows to 250 to 962 ms about every 300 s during text indexing (cause not found).
+
+**Image boost floor (2026-10-17)**: the QA showed that every image in the 30-file vector pool scored at least 0.678, above any vector-only text hit (at most 0.5). A Docker smoke ranked an unrelated PNG 2nd for a text query. Taras chose a similarity floor: the image term doubles only when the image is close enough to the query, calibrated on the spike eval and the QA data.
+Result: floor 0.69 cosine (`MIN_IMAGE_BOOST_SIMILARITY` in `ops/search.ts`, calibration in `/tmp/eg2-plan/p7f-calibration/`). Relevant pairs (n=20): min 0.677, p10 0.702, median 0.762. Unrelated pairs (n=4478): median 0.600, p90 0.648, max 0.785. It keeps 19 of 20 relevant pairs and rejects 99 % of unrelated pairs (78 % of the closest three per query). All 3 QA targets stay at rank 1, and no image reaches the top 3 for "Slack invoice billing statement", "SIL Open Font License" or "basalt lighthouse maintenance log".
+
 **Implementation Note**: After this phase, pause for manual confirmation. Then commit `[phase 7] EmbeddingGemma 2 default for fresh indexes`, run `bun install --frozen-lockfile` and `bun run scripts/sync-versions.ts --check`, run `./scripts/release.sh 0.18.0`, and open the PR.
+
+---
+
+## Phase 8: chunker swap and embedding size cap (0.18.1)
+
+Taras's choices (2026-10-17): swap `chonkie` for `@chonkiejs/core` before the prod switch, so his drive re-embeds only once with the final chunker, and skip vector embedding for text over 1 MB. Design memo for the swap: `/tmp/eg2-plan/chonkie-swap.md` (the go conditions and the 9-step list there are part of this spec).
+
+### Changes Required:
+
+#### 1. Chunker swap
+- Replace `chonkie` with `@chonkiejs/core` pinned to exactly `0.0.12` in `packages/core` and `packages/cli`. Add `@kreuzberg/tree-sitter-language-pack` as `empty-npm-package` in the root `overrides` (agent-fs never loads it). Remove the 8 chonkie-era `empty-npm-package` overrides and the transformers override. Replace `--external chonkie` with `--external @chonkiejs/core`.
+- `chunker.ts`: `RecursiveChunker` from `@chonkiejs/core` with `chunkSize: CHUNK_CHARS` (2000, under the nomic 2048-token context). `tokenCount` becomes `Math.ceil(text.length / 4)`. Keep the segments and the fallback, and give the fallback the same limit.
+- Remove the Linux guard (`linuxRuntimeConflict`, `transformersRuntimeConflict`, `packageVersion`) and its test. Keep the transformers version check.
+- Nothing re-embeds: the chunker is not part of the stored format. Do not bump `REVISIONS`.
+
+#### 2. Embedding size cap
+- `AGENT_FS_EMBEDDING_MAX_BYTES`: a positive integer. Unset or invalid means no cap, so other installs do not change.
+- A file whose text (file content, or extracted PDF text) is over the cap gets FTS as usual, no text chunks or vectors (old ones are deleted), and `embedding_status = 'skipped'`. Image and PDF-page embedding does not change.
+- `reindex` and the migration treat `skipped` like `indexed`. At boot, when the cap differs from the one stored in `meta`, `skipped` files and indexed files larger than the new cap become `pending`, so the pipeline applies the new cap.
+- `stat`, the CLI, MCP and live show `skipped` (check every place that lists statuses).
+
+### Success Criteria:
+
+#### Automated Verification:
+- [ ] `bun install --frozen-lockfile`, `bun run typecheck`, `bun run test`, `bun run build`
+- [ ] `bun pm ls --all | grep -E "transformers|onnxruntime-node|chonkie"`: one transformers (4.3.1), one onnxruntime-node (1.30.0), `@chonkiejs/core` only
+- [ ] Golden chunk test (markdown with a code fence, CRLF, CJK, a long URL, a base64 line, CSV rows): `[charOffset, length]` snapshot, every chunk at most 2000 characters, chunks join back to the text
+- [ ] `/tmp/eg2-plan/scripts/chunk-compare.ts` on the 20 baseline files: offsets map back, no chunk over 2000 characters. Report chunk count and size against `chunks-before.json`
+- [ ] Manual: nomic and EmbeddingGemma 2 vectors for 3 fixed strings are equal before and after the swap. nomic token count of every chunk is at most 2048
+- [ ] Cap unit tests: a file over the cap is FTS-indexed, has no text chunks and is `skipped`. A cap change re-queues the right files. `reindex` skips `skipped` files. No cap gives today's behavior
+- [ ] E2E `--local-only` and full pass, except the known `share-create` failure
+
+#### QA:
+- [ ] Docker image (arm64): one onnxruntime-node, EmbeddingGemma 2 indexes a file, a 2 MB text file is `skipped` with `AGENT_FS_EMBEDDING_MAX_BYTES=1048576`
+- [ ] Linux global install (`bun add -g` of the packed tgz plus `@huggingface/transformers@4.3.1`) in arm64 and amd64 containers: `config validate` reports that transformers loads, and a fresh index picks `embeddinggemma-2` and finds a file with `vec-search`. Then update the Linux limits in `DEPLOYMENT.md`
+- [ ] Spike eval rerun as a smoke check (40 queries)
+
+Release checklist: SKILL.md (status list, cap env if documented there), E2E as a regression check, `./scripts/release.sh 0.18.1`.
+
+---
+
+## Phase 9: switch Taras's prod drive to EmbeddingGemma 2
+
+Target: `agent-fs-taras` on Fly, org `swarm`, drive `default`. Every step below changes prod and needs Taras's explicit go at the time.
+
+Drive (2026-10-17): 10,333 files. About 45k text chunks under the 1 MB cap (31 files over 1 MB hold 189 MB of the 302 MB of text), about 4,000 images and 87 PDFs. Last 7 days: 869 text files (27.5 MB) and 976 images.
+
+### Steps:
+1. Check the volume has room for the models (about 530 MB): `fly volumes list -a agent-fs-taras`.
+2. Scale to `performance-8x` with 16 GB. One inference uses about 4 to 5 cores, so a bigger machine adds little without a worker pool.
+3. Set `EMBEDDING_PROVIDER=local`, `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE=1`, `AGENT_FS_EMBEDDING_MAX_BYTES=1048576`. Keep `EMBEDDING_API_KEY` for a rollback.
+4. Watch the boot line (`embeddinggemma-2`), the migration progress, `/health` and RSS. Estimate: 12 to 18 h. Meanwhile file operations work, keyword search works, and semantic results mix old OpenAI and new vectors.
+5. When the migration ends: scale to `performance-2x` with 4 GB, and remove `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE`.
+6. Rollback at any point: `EMBEDDING_PROVIDER=openai`. The OpenAI re-embed takes minutes.
+
+### Success Criteria:
+- [ ] Boot line names `embeddinggemma-2`, and the stored format becomes `embeddinggemma:v2`
+- [ ] All text files `indexed` or `skipped`, images `indexed` (or `failed` for files that are not real images)
+- [ ] `/health` stays under 1 s during the migration
+- [ ] Image and PDF-page search works on the drive (3 hand-picked queries)
+- [ ] After the scale-down, a new write is searchable within a few minutes
 
 ---
 

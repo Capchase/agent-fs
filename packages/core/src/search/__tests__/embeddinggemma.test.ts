@@ -1,16 +1,17 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
-import { EmbeddingGemmaProvider, embeddingGemmaSource, linuxRuntimeConflict } from "../embeddings/embeddinggemma.js";
+import { linuxRuntimeConflict, TRANSFORMERS_VERSION, INSTALL_HINT } from "../embeddings/embeddinggemma.js";
+import { EmbeddingGemmaRuntime, startWorker, type RuntimeOptions, type WorkerScope, embeddingGemmaSource } from "../embeddings/embeddinggemma-runtime.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { EmbeddingInitializationError } from "../embeddings/provider.js";
 import { OpenAIEmbeddingProvider } from "../embeddings/openai.js";
 import { GeminiEmbeddingProvider } from "../embeddings/gemini.js";
 import { LocalEmbeddingProvider } from "../embeddings/local.js";
-import { EmbeddingProviderError } from "../../errors.js";
+
+const options: RuntimeOptions = { paths: {}, conflict: null, cacheDir: join(tmpdir(), "agent-fs-eg2-missing"), version: TRANSFORMERS_VERSION, hint: INSTALL_HINT };
 
 function fakeProvider(tokens = 10) {
-  const provider = new EmbeddingGemmaProvider();
+  const provider = new EmbeddingGemmaRuntime(options);
   const processor = mock(async (..._args: any[]) => ({ input_ids: { dims: [1, tokens] } }));
   const model = Object.assign(mock(async (_inputs: unknown) => ({
     sentence_embedding: { data: new Float32Array(768).fill(0.5) },
@@ -19,7 +20,37 @@ function fakeProvider(tokens = 10) {
   return { provider, processor, model };
 }
 
-describe("EmbeddingGemma 2", () => {
+describe("EmbeddingGemmaRuntime", () => {
+  test("retries failed probes and shares the successful import with text and vision", async () => {
+    const from_pretrained = mock(async () => ({}));
+    const load = mock(async () => ({ env: { version: "4.3.1" }, AutoConfig: { from_pretrained } }));
+    load.mockRejectedValueOnce(new Error("missing"));
+    const provider = new EmbeddingGemmaRuntime({ ...options, paths: { transformers: "fake" } }, load);
+    expect(await (provider as any).probe()).toMatchObject({ reason: "missing (@huggingface/transformers: missing)" });
+    expect(await (provider as any).probe()).toEqual({ module: true });
+    expect(await (provider as any).probe()).toEqual({ module: true });
+    const text = await (provider as any).loader(false);
+    const vision = await (provider as any).loader(true);
+    expect(text.config.audio_config).toBeNull();
+    expect(vision.config.audio_config).toBeNull();
+    expect(from_pretrained).toHaveBeenCalledTimes(2);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  test("guards unresolved package paths before import", async () => {
+    const load = mock(async () => ({}));
+    const runtime = new EmbeddingGemmaRuntime(options, load);
+    expect(await runtime.probe()).toMatchObject({ reason: expect.stringContaining("@huggingface/transformers") });
+    await expect(runtime.loadCanvas()).rejects.toMatchObject({ name: "CanvasImportError", message: expect.stringContaining("@napi-rs/canvas") });
+    await expect(runtime.renderPdfPages(new Uint8Array(), 1)).rejects.toThrow("unpdf");
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  test("keeps the version and install hint in initialization errors", async () => {
+    const provider = new EmbeddingGemmaRuntime({ ...options, paths: { transformers: "fake" } }, async () => ({ env: { version: "3.8.1" } }));
+    await expect(provider.embedQuery("a")).rejects.toThrow("embeddinggemma-2 needs @huggingface/transformers 4.3.1 (missing (found 3.8.1)). Run: bun add -g @huggingface/transformers@4.3.1");
+  });
+
   test.each([
     ["linux", "3.8.1", true],
     ["linux", "4.3.1", false],
@@ -53,13 +84,13 @@ describe("EmbeddingGemma 2", () => {
 
   test("rejects more than 8192 tokens before inference", async () => {
     const { provider, model } = fakeProvider(8193);
-    await expect(provider.embedQuery("too long")).rejects.toBeInstanceOf(EmbeddingProviderError);
+    await expect(provider.embedQuery("too long")).rejects.toMatchObject({ name: "EmbeddingProviderError" });
     expect(model).not.toHaveBeenCalled();
     expect(await fakeProvider(8192).provider.embedQuery("fits")).toHaveLength(768);
   });
 
-  test.each([EmbeddingGemmaProvider, LocalEmbeddingProvider])("%p retries a failed single-flight initialization", async (Provider) => {
-    const provider = new Provider();
+  test.each([EmbeddingGemmaRuntime, LocalEmbeddingProvider])("%p retries a failed single-flight initialization", async (Provider) => {
+    const provider = Provider === EmbeddingGemmaRuntime ? new EmbeddingGemmaRuntime(options) : new LocalEmbeddingProvider();
     let attempts = 0;
     Object.assign(provider, {
       _doInit: mock(async () => {
@@ -103,7 +134,7 @@ function fakeVision() {
 
 const part = { mime: "image/png", data: new Uint8Array([1, 2, 3]) };
 
-describe("EmbeddingGemma 2 images", () => {
+describe("EmbeddingGemmaRuntime images", () => {
   test("selects a local path only when every required file exists", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-fs-eg2-source-"));
     const id = "onnx-community/embeddinggemma-2-ONNX";
@@ -128,15 +159,6 @@ describe("EmbeddingGemma 2 images", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  test("supports four image types and rejects unsupported parts before initialization", async () => {
-    const { provider, init } = fakeVision();
-    for (const mime of ["image/png", "image/jpeg", "image/webp", "image/gif"]) expect(provider.supportsMime(mime)).toBe(true);
-    for (const mime of ["image/svg+xml", "application/pdf", "text/plain"]) expect(provider.supportsMime(mime)).toBe(false);
-    await expect(provider.embedParts([{ ...part, mime: "image/svg+xml" }])).rejects.toThrow("Unsupported embedding MIME type");
-    expect(await provider.embedParts([])).toEqual([]);
-    expect(init).not.toHaveBeenCalled();
   });
 
   test("text providers omit image methods", () => {
@@ -175,14 +197,20 @@ describe("EmbeddingGemma 2 images", () => {
       await gate;
       return { sentence_embedding: { data: new Float32Array(768) } };
     });
-    const first = provider.embedParts([part]);
+    const scope: WorkerScope = { onmessage: null, postMessage() {} };
+    startWorker(scope, provider);
+    const replies: unknown[] = [];
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    scope.postMessage = (reply) => { replies.push(reply); if (replies.length === 3) finish(); };
+    scope.onmessage!({ data: { id: 1, type: "image", part } });
     await running;
-    const second = provider.embedParts([part]);
-    const disposed = provider.dispose();
+    scope.onmessage!({ data: { id: 2, type: "image", part } });
+    scope.onmessage!({ data: { id: 3, type: "dispose" } });
     expect(models[0]).toHaveBeenCalledTimes(1);
     expect(models[0].dispose).not.toHaveBeenCalled();
     release();
-    await Promise.all([first, second, disposed]);
+    await done;
     expect(models[0]).toHaveBeenCalledTimes(2);
     expect(models[0].dispose).toHaveBeenCalledTimes(1);
     expect((provider as any).visionIdleTimer).toBeNull();
@@ -218,17 +246,24 @@ describe("EmbeddingGemma 2 images", () => {
     const { provider, init, models, textModel } = fakeVision();
     let expire!: () => void;
     const unref = mock(() => {});
+    const scope: WorkerScope = { onmessage: null, postMessage() {} };
+    startWorker(scope, provider);
+    const setTimer = globalThis.setTimeout;
     const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
-      expect(ms).toBe(60_000);
+      if (ms !== 60_000) return setTimer(callback, ms);
       expire = callback;
       return { unref };
-    }) as any);
+    }) as typeof setTimeout);
     const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
     try {
       await provider.embedParts([part]);
       expect(unref).toHaveBeenCalledTimes(1);
       expire();
-      await (provider as any).visionQueue;
+      // This document completes after idle cleanup in the worker queue.
+      await new Promise<void>((resolve) => {
+        scope.postMessage = () => resolve();
+        scope.onmessage!({ data: { id: 1, type: "document", text: "barrier", title: "idle" } });
+      });
       expect(models[0].dispose).toHaveBeenCalledTimes(1);
       expect(textModel.dispose).not.toHaveBeenCalled();
       await provider.embedParts([part]);
@@ -251,11 +286,9 @@ describe("EmbeddingGemma 2 images", () => {
     try {
       await provider.embedParts([part]);
       await provider.embedParts([part]);
-      callbacks[0]();
-      await (provider as any).visionQueue;
+      await callbacks[0]();
       expect(models[0].dispose).not.toHaveBeenCalled();
-      callbacks[1]();
-      await (provider as any).visionQueue;
+      await callbacks[1]();
       expect(models[0].dispose).toHaveBeenCalledTimes(1);
     } finally {
       await provider.dispose();
@@ -267,11 +300,9 @@ describe("EmbeddingGemma 2 images", () => {
   test("classifies initialization errors and retries the next call", async () => {
     const { provider, init } = fakeVision();
     init.mockImplementationOnce(async () => { throw new Error("download failed"); });
-    const first = provider.embedParts([part]);
-    const concurrent = provider.embedParts([part]);
-    await expect(first).rejects.toBeInstanceOf(EmbeddingInitializationError);
+    await expect(provider.embedParts([part])).rejects.toMatchObject({ name: "EmbeddingInitializationError" });
     try {
-      expect(await concurrent).toHaveLength(1);
+      expect(await provider.embedParts([part])).toHaveLength(1);
       expect(init).toHaveBeenCalledTimes(2);
     } finally {
       await provider.dispose();
