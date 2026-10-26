@@ -1,6 +1,7 @@
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { getRegisteredOps, getOpDefinition } from "./ops/index.js";
 import { profileUpdateSchema } from "./identity/users.js";
+import { presenceStateSchema } from "./presence/schema.js";
 import { VERSION } from "./version.js";
 
 export function generateOpenAPISpec() {
@@ -31,6 +32,36 @@ export function generateOpenAPISpec() {
     },
     additionalProperties: false,
   }));
+
+  const presenceState = zodToJsonSchema(presenceStateSchema, { target: "openApi3" }) as any;
+  delete presenceState.$schema;
+  const presenceSession = {
+    type: "object",
+    required: [...presenceState.required, "sessionId", "userId", "email", "displayName", "updatedAt"],
+    properties: {
+      ...presenceState.properties,
+      sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{8,64}$" },
+      userId: { type: "string" }, email: { type: "string" },
+      displayName: { type: "string", nullable: true },
+      updatedAt: { type: "string", format: "date-time", description: "Last state change" },
+    },
+  };
+  const presenceSnapshot = {
+    type: "object", required: ["driveId", "sessions", "at"],
+    properties: {
+      driveId: { type: "string" }, sessions: { type: "array", items: presenceSession },
+      at: { type: "string", format: "date-time" },
+    },
+  };
+  const presenceParameters = [
+    { name: "orgId", in: "path", required: true, schema: { type: "string" } },
+    { name: "driveId", in: "path", required: true, schema: { type: "string" } },
+  ];
+  const presenceErrors = {
+    "401": { description: "Missing or invalid Bearer key" },
+    "404": { description: "Drive not found or the user is not a member" },
+    "429": { description: "RATE_LIMITED: presence request limit or 32 sessions per user per drive exceeded" },
+  };
 
   return {
     openapi: "3.1.0",
@@ -72,12 +103,105 @@ export function generateOpenAPISpec() {
                         minimum: 1,
                         description: "Maximum raw upload size in bytes",
                       },
+                      features: {
+                        type: "array",
+                        items: { type: "string" },
+                        description:
+                          "Optional capabilities this server supports (e.g. \"share-links\"). Absent on older servers.",
+                      },
                     },
                     required: ["ok", "version", "maxUploadBytes"],
                   },
                 },
               },
             },
+          },
+        },
+      },
+      "/share/{token}": {
+        get: {
+          summary: "Public share page",
+          description:
+            "Unauthenticated HTML preview of a file shared with the share-create op, with a Download button. The token is the only credential. Expired, revoked and used-up links return the same 'link expired' page (404 for an unknown token, 410 otherwise). Each successful page view counts against maxViews.",
+          operationId: "sharePage",
+          tags: ["Share"],
+          security: [],
+          parameters: [
+            { name: "token", in: "path", required: true, schema: { type: "string", minLength: 43, maxLength: 43 } },
+          ],
+          responses: {
+            "200": { description: "The share page", content: { "text/html": { schema: { type: "string" } } } },
+            "302": { description: "The share is a folder (kind \"site\"): redirect to /site/{token}/" },
+            "404": { description: "Unknown token or file no longer available", content: { "text/html": { schema: { type: "string" } } } },
+            "410": { description: "Link expired, revoked or used up", content: { "text/html": { schema: { type: "string" } } } },
+            "429": { description: "Too many requests from this address" },
+          },
+        },
+      },
+      "/share/{token}/raw": {
+        get: {
+          summary: "Inline bytes for a share embed",
+          description:
+            "Serves (or redirects to a short-lived presigned URL for) the shared file inline. Only images, PDF, audio, video and HTML; SVG is never served inline. An HTML page is always proxied (never presigned), at most 25 MB, with `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; frame-ancestors 'self'`, so it runs in an opaque origin whether framed by the share page or opened on its own. Does not count as a view.",
+          operationId: "shareRaw",
+          tags: ["Share"],
+          security: [],
+          parameters: [
+            { name: "token", in: "path", required: true, schema: { type: "string", minLength: 43, maxLength: 43 } },
+          ],
+          responses: {
+            "200": { description: "File bytes" },
+            "302": { description: "Redirect to a short-lived presigned URL" },
+            "404": { description: "Not found or not embeddable" },
+            "410": { description: "Link expired, revoked or used up" },
+          },
+        },
+      },
+      "/share/{token}/download": {
+        get: {
+          summary: "Download a shared file",
+          description:
+            "Serves (or redirects to a short-lived presigned URL for) the shared file with Content-Disposition: attachment. Does not count as a view.",
+          operationId: "shareDownload",
+          tags: ["Share"],
+          security: [],
+          parameters: [
+            { name: "token", in: "path", required: true, schema: { type: "string", minLength: 43, maxLength: 43 } },
+          ],
+          responses: {
+            "200": { description: "File bytes as an attachment" },
+            "302": { description: "Redirect to a short-lived presigned URL" },
+            "404": { description: "File no longer available" },
+            "410": { description: "Link expired, revoked or used up" },
+          },
+        },
+      },
+      "/site/{token}/{path}": {
+        get: {
+          summary: "File of a shared folder (site share)",
+          description:
+            "Serves a file from a folder shared with the share-create op (kind \"site\"). An empty path or one ending in '/' serves that folder's index.html. A folder without index.html redirects (302) to its only .html/.htm file, or else returns an HTML listing of its HTML pages (other files and sub-folders are never listed); a folder with no HTML page is 404. A folder named without its trailing slash redirects (301) to the slash form when that serves a page. `/site/{token}` redirects to `/site/{token}/`. The token is the only credential. Every response is proxied through this server (no presigned redirects) and carries `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; frame-ancestors *` (an opaque origin: no cookies or storage), `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and `Access-Control-Allow-Origin: *`. Files over 25 MB are refused. Does not count views. `/site/*` has its own per-IP rate limit (`AGENT_FS_SITE_RATE_LIMIT`, default 600/min).",
+          operationId: "siteFile",
+          tags: ["Share"],
+          security: [],
+          parameters: [
+            { name: "token", in: "path", required: true, schema: { type: "string", minLength: 43, maxLength: 43 } },
+            {
+              name: "path",
+              in: "path",
+              required: true,
+              description: "Path inside the shared folder; may contain '/'. Empty for index.html.",
+              schema: { type: "string" },
+            },
+          ],
+          responses: {
+            "200": { description: "File bytes, with the content type of the file name" },
+            "301": { description: "Redirect to the folder form with a trailing slash" },
+            "400": { description: "Path is not valid inside the folder ('.', '..', NUL, bad encoding)" },
+            "404": { description: "Unknown token, not a site share, or no such file" },
+            "410": { description: "Link expired or revoked" },
+            "413": { description: "File is larger than 25 MB" },
+            "429": { description: "Too many requests from this address" },
           },
         },
       },
@@ -273,6 +397,127 @@ export function generateOpenAPISpec() {
                 },
               },
             },
+          },
+        },
+      },
+      "/orgs/{orgId}/drives/{driveId}/presence": {
+        get: {
+          summary: "Get drive presence", operationId: "getPresence", tags: ["Drives"],
+          description: "Any drive member can read the in-memory snapshot. Presence expires after 45 seconds without a PUT.",
+          parameters: presenceParameters,
+          responses: {
+            "200": { description: "Presence snapshot", content: { "application/json": { schema: presenceSnapshot } } },
+            ...presenceErrors,
+          },
+        },
+      },
+      "/orgs/{orgId}/drives/{driveId}/presence/{sessionId}": {
+        parameters: [...presenceParameters, {
+          name: "sessionId", in: "path", required: true,
+          schema: { type: "string", pattern: "^[A-Za-z0-9_-]{8,64}$" },
+        }],
+        put: {
+          summary: "Update a presence session", operationId: "putPresence", tags: ["Drives"],
+          description: "Any drive member can insert or replace their session. Unknown body keys are stripped. Equal states refresh TTL without broadcasting.",
+          requestBody: { required: true, content: { "application/json": { schema: presenceState } } },
+          responses: {
+            "200": { description: "Presence session", content: { "application/json": { schema: {
+              type: "object", required: ["session"], properties: { session: presenceSession },
+            } } } },
+            "400": { description: "VALIDATION_ERROR: invalid sessionId or body" },
+            "409": { description: "EDIT_CONFLICT: sessionId belongs to another user" },
+            ...presenceErrors,
+          },
+        },
+        delete: {
+          summary: "Delete a presence session", operationId: "deletePresence", tags: ["Drives"],
+          description: "Only the owner can delete a session. An unknown session also succeeds.",
+          responses: {
+            "200": { description: "Session removed or unknown", content: { "application/json": { schema: {
+              type: "object", required: ["ok"], properties: { ok: { type: "boolean", const: true } },
+            } } } },
+            "400": { description: "VALIDATION_ERROR: invalid sessionId" },
+            "409": { description: "EDIT_CONFLICT: sessionId belongs to another user" },
+            ...presenceErrors,
+          },
+        },
+      },
+      "/orgs/{orgId}/drives/{driveId}/events": {
+        get: {
+          summary: "Stream drive changes",
+          operationId: "watchDrive",
+          tags: ["Drives"],
+          description:
+            "Drive members can stream committed changes with Bearer authentication. The first event is ready. Heartbeat comments (: ping) arrive every 5 seconds. Each user can open at most 8 concurrent streams. Events are live only, with no replay.",
+          parameters: [
+            { name: "presence", in: "query", schema: { type: "string", enum: ["1"] }, description: "Opt in to presence frames. Without presence=1 no presence frames are sent." },
+            { name: "sessionId", in: "query", schema: { type: "string", pattern: "^[A-Za-z0-9_-]{8,64}$" }, description: "With presence=1, bind a valid sessionId. The last stream to close removes its session." },
+            { name: "orgId", in: "path", required: true, schema: { type: "string" } },
+            { name: "driveId", in: "path", required: true, schema: { type: "string" } },
+          ],
+          responses: {
+            "200": {
+              description: "SSE frames use event: <name> and data: <JSON>, followed by a blank line.",
+              content: { "text/event-stream": {
+                schema: { type: "string" },
+                example: 'event: ready\ndata: {"driveId":"drive-id","at":"2026-09-30T12:00:00.000Z"}\n\n: ping\n\n',
+              } },
+              "x-sse-events": {
+                "presence.snapshot": { ...presenceSnapshot, description: "Only sent when presence=1, immediately after ready." },
+                "presence.updated": {
+                  type: "object", description: "Only sent when presence=1.",
+                  required: ["type", "driveId", "session", "at"],
+                  properties: {
+                    type: { type: "string", const: "presence.updated" }, driveId: { type: "string" },
+                    session: presenceSession, at: { type: "string", format: "date-time" },
+                  },
+                },
+                "presence.left": {
+                  type: "object", description: "Only sent when presence=1.",
+                  required: ["type", "driveId", "sessionId", "userId", "at"],
+                  properties: {
+                    type: { type: "string", const: "presence.left" }, driveId: { type: "string" },
+                    sessionId: { type: "string" }, userId: { type: "string" }, at: { type: "string", format: "date-time" },
+                  },
+                },
+                ready: {
+                  type: "object",
+                  required: ["driveId", "at"],
+                  properties: { driveId: { type: "string" }, at: { type: "string", format: "date-time" } },
+                },
+                "file.changed": {
+                  type: "object",
+                  required: ["type", "driveId", "path", "version", "operation", "actor", "at"],
+                  properties: {
+                    type: { type: "string", const: "file.changed" },
+                    driveId: { type: "string" },
+                    path: { type: "string" },
+                    version: { type: "integer", minimum: 1 },
+                    operation: { type: "string", enum: ["write", "edit", "append", "delete", "revert"] },
+                    actor: { type: "string", description: "User ID of the actor" },
+                    at: { type: "string", format: "date-time" },
+                  },
+                },
+                "comment.changed": {
+                  type: "object",
+                  required: ["type", "driveId", "path", "commentId", "parentId", "action", "actor", "at"],
+                  properties: {
+                    type: { type: "string", const: "comment.changed" },
+                    driveId: { type: "string" },
+                    path: { type: "string" },
+                    commentId: { type: "string" },
+                    parentId: { type: ["string", "null"] },
+                    action: { type: "string", enum: ["created", "updated", "resolved", "reopened", "deleted"] },
+                    actor: { type: "string", description: "User ID of the actor" },
+                    at: { type: "string", format: "date-time" },
+                  },
+                },
+              },
+            },
+            "401": { description: "Missing or invalid Bearer key" },
+            "404": { description: "Drive not found or the user is not a member" },
+            "409": { description: "EDIT_CONFLICT: with presence=1, the sessionId belongs to another user" },
+            "429": { description: "Concurrent stream cap or request rate limit exceeded" },
           },
         },
       },

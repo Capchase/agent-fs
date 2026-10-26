@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import type { ApiClient } from "../api-client.js";
 import { getConfig, getOpDefinition } from "@/core";
-import { outputResult } from "../formatters.js";
+import { diffSourceWarning, outputResult, writeLinkWarnings } from "../formatters.js";
 import { stdio } from "../stdio.js";
 
 interface OpCommandDef {
@@ -41,6 +41,7 @@ const OP_COMMANDS: OpCommandDef[] = [
   { name: "append", args: [{ name: "path", required: true }], options: [{ flag: "--content <text>", description: "Content to append" }, { flag: "-m, --message <msg>", description: "Version message" }] },
   { name: "ls", args: [{ name: "path", required: false }], options: [] },
   { name: "stat", args: [{ name: "path", required: true }], options: [] },
+  { name: "reveal", args: [{ name: "path", required: true }], options: [] },
   { name: "rm", args: [{ name: "path", required: true }], options: [] },
   { name: "mv", args: [{ name: "from", required: true }, { name: "to", required: true }], options: [{ flag: "-m, --message <msg>", description: "Version message" }] },
   { name: "cp", args: [{ name: "from", required: true }, { name: "to", required: true }], options: [] },
@@ -56,6 +57,7 @@ const OP_COMMANDS: OpCommandDef[] = [
   { name: "reindex", args: [], options: [{ flag: "--path <prefix>", description: "Path prefix filter" }] },
   { name: "tree", args: [{ name: "path", required: false }], options: [{ flag: "--depth <n>", description: "Max recursion depth" }] },
   { name: "glob", args: [{ name: "pattern", required: true }], options: [{ flag: "--path <prefix>", description: "Path prefix filter" }] },
+  { name: "find", args: [{ name: "query", required: true }], options: [{ flag: "--path <prefix>", description: "Path prefix filter" }, { flag: "--limit <n>", description: "Max results (default: 50)" }] },
   {
     name: "signed-url",
     args: [{ name: "path", required: true }],
@@ -64,6 +66,26 @@ const OP_COMMANDS: OpCommandDef[] = [
       { flag: "--inline", description: "Ask the browser to render the file instead of downloading it (Content-Disposition: inline)" },
     ],
   },
+  {
+    name: "share-create",
+    args: [{ name: "path", required: true }],
+    options: [
+      { flag: "--expires-in <seconds>", description: "Expiry in seconds (default: 86400 = 24h, max: 604800 = 7d)" },
+      { flag: "--max-views <n>", description: "Limit how many times the page can be opened" },
+      { flag: "--one-off", description: "Single-use link (same as --max-views 1)" },
+    ],
+  },
+  {
+    name: "share-revoke",
+    args: [{ name: "id", required: false }],
+    options: [
+      { flag: "--token <token-or-url>", description: "Revoke by share token or the full share URL" },
+      { flag: "--path <path>", description: "Revoke every share link of this file" },
+    ],
+  },
+  { name: "favorite-add", args: [{ name: "path", required: true }], options: [] },
+  { name: "favorite-remove", args: [{ name: "path", required: true }], options: [] },
+  { name: "favorite-list", args: [], options: [] },
 ];
 
 export function registerOpCommands(
@@ -159,13 +181,18 @@ export function registerOpCommands(
         params.expiresIn = params["expires-in"];
         delete params["expires-in"];
       }
+      // `--one-off` is sugar for `--max-views 1` (commander camel-cases it).
+      if (params.oneOff !== undefined) {
+        if (params.oneOff) params.maxViews = 1;
+        delete params.oneOff;
+      }
       // `--inline` is a boolean flag; the op takes an explicit disposition.
       if (params.inline !== undefined) {
         if (params.inline) params.disposition = "inline";
         delete params.inline;
       }
 
-      for (const key of ["offset", "limit", "lines", "v1", "v2", "version", "expectedVersion", "depth", "expiresIn"]) {
+      for (const key of ["offset", "limit", "lines", "v1", "v2", "version", "expectedVersion", "depth", "expiresIn", "maxViews"]) {
         if (params[key] !== undefined) {
           params[key] = parseInt(params[key]);
         }
@@ -210,11 +237,17 @@ export function registerOpCommands(
             ifMatch: params.expectedVersion,
             message: params.message,
           });
+          for (const warning of writeLinkWarnings(result)) console.error(warning);
           outputResult(def.name, result, program.opts().json);
           return;
         }
 
         const result = await client.callOp(orgId, def.name, params);
+
+        if (def.name === "write") {
+          // stderr even in --json mode: stdout stays the result document.
+          for (const warning of writeLinkWarnings(result)) console.error(warning);
+        }
 
         if (def.name === "cat" && result?.truncated) {
           // Always surfaced on stderr — even in --json mode — so a
@@ -223,6 +256,13 @@ export function registerOpCommands(
           // content or the JSON document, never this marker).
           const shown = result.content ? String(result.content).split("\n").length : 0;
           console.error(`truncated: showing ${shown} of ${result.totalLines} lines (use --limit)`);
+        }
+
+        if (def.name === "diff") {
+          // stderr even in --json mode, like the cat truncation marker: an
+          // uncompared diff must never pass for a clean one.
+          const warning = diffSourceWarning(result);
+          if (warning) console.error(warning);
         }
 
         if (def.name === "cat" && !program.opts().json && (catRaw || !catStdoutIsTty)) {

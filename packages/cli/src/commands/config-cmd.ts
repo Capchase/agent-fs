@@ -9,6 +9,9 @@ import {
   createStorageAdapter,
   isLocalStorageConfig,
   createEmbeddingProviderFromEnv,
+  loadTransformers,
+  NOMIC_MODEL,
+  EMBEDDINGGEMMA_MODEL,
 } from "@/core";
 
 export function configCommands() {
@@ -43,7 +46,10 @@ export function configCommands() {
       try {
         parsed = JSON.parse(value);
       } catch {}
-      setConfigValue(key, parsed);
+      const removedProviderFields = setConfigValue(key, parsed);
+      if (removedProviderFields) {
+        console.log("Removed embedding.model and embedding.apiKey for the previous provider.");
+      }
       console.log(`Set ${key} = ${JSON.stringify(parsed)}`);
     });
 
@@ -140,8 +146,10 @@ export function configCommands() {
 
       // 6. Embedding provider
       const embProvider = config.embedding.provider;
-      const hasEmbKey = !!config.embedding.apiKey || !!process.env.OPENAI_API_KEY || !!process.env.GEMINI_API_KEY;
-      if (embProvider === "openai" || embProvider === "gemini") {
+      const hasEmbKey = !!config.embedding.apiKey || (embProvider === "openrouter"
+        ? !!process.env.OPENROUTER_API_KEY
+        : !!process.env.OPENAI_API_KEY || !!process.env.GEMINI_API_KEY);
+      if (embProvider === "openai" || embProvider === "gemini" || embProvider === "openrouter") {
         if (hasEmbKey) {
           try {
             const provider = await createEmbeddingProviderFromEnv(config.embedding);
@@ -161,10 +169,19 @@ export function configCommands() {
           });
         }
       } else {
+        const model = config.embedding.model;
+        const transformers = await loadTransformers();
+        const loads = "module" in transformers;
+        const hint = !loads && (!model || model === EMBEDDINGGEMMA_MODEL) && transformers.hint ? `. ${transformers.hint}` : "";
+        const status = loads ? "transformers 4.3.1 loads locally" : `transformers 4.3.1 unavailable: ${transformers.reason}${hint}`;
+        const defaultModel = model ? "" : ` Default for a fresh index: ${EMBEDDINGGEMMA_MODEL} when transformers loads, else ${NOMIC_MODEL}. An existing index keeps its model.`;
+        const known = !model || model === NOMIC_MODEL || model === EMBEDDINGGEMMA_MODEL;
         results.push({
           name: "Embeddings",
-          ok: true,
-          message: "local/disabled (semantic search may be unavailable)",
+          ok: !model || model === NOMIC_MODEL || (model === EMBEDDINGGEMMA_MODEL && loads),
+          message: known
+            ? `configured local model: ${model || "default"}.${defaultModel} ${status}`
+            : `unknown local model: ${model}. Use ${NOMIC_MODEL} or ${EMBEDDINGGEMMA_MODEL}`,
         });
       }
 

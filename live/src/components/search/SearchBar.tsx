@@ -10,10 +10,11 @@ import {
 } from "@/components/ui/tooltip"
 import { SearchModeToggle, type SearchTab } from "./SearchModeToggle"
 import { SearchModal } from "./SearchModal"
-import { useGlobSearch } from "@/hooks/use-glob-search"
+import { isFindQueryLongEnough, useFindSearch } from "@/hooks/use-find-search"
 import { useAuth } from "@/contexts/auth"
 import { useSearchInput } from "@/contexts/search-input"
 import { uiChromeStore } from "@/stores/ui-chrome"
+import { describeRequestError } from "@/lib/request-errors"
 import {
   setSearchLoading,
   setSearchResults,
@@ -29,7 +30,7 @@ export function SearchBar() {
   const [modalOpen, setModalOpen] = useState(false)
   const [modalQuery, setModalQuery] = useState("")
   const inputRef = useRef<HTMLInputElement>(null)
-  const { register } = useSearchInput()
+  const { register, registerContentSearch } = useSearchInput()
   const { driveId } = useAuth()
 
   // Register the input ref so the global keyboard shortcut hook can focus it
@@ -45,55 +46,55 @@ export function SearchBar() {
     return () => clearTimeout(t)
   }, [query])
 
-  // Glob search drives the in-tree filter for the Files tab.
-  const globResult = useGlobSearch(tab === "files" ? debouncedQuery : "")
+  // Fuzzy file-name search drives the result list for the Files tab.
+  const findResult = useFindSearch(tab === "files" ? debouncedQuery : "")
 
   // Hide stale results as soon as the query or drive changes. The debounced
   // request effect below replaces this state with its exact outcome.
   useLayoutEffect(() => {
-    if (tab !== "files" || !query) {
+    if (tab !== "files" || !isFindQueryLongEnough(query)) {
       clearSearchFilter()
       return
     }
     setSearchLoading(query, driveId)
   }, [tab, query, driveId])
 
-  // Files tab: populate the in-tree filter from the active drive-wide glob.
+  // Files tab: populate the result list from the active drive-wide search.
   useEffect(() => {
     if (
       tab !== "files" ||
-      !debouncedQuery ||
+      !isFindQueryLongEnough(debouncedQuery) ||
       debouncedQuery !== query ||
       !driveId
     ) {
       return
     }
-    if (globResult.isFetching) {
+    if (findResult.isFetching) {
       setSearchLoading(debouncedQuery, driveId)
       return
     }
-    if (globResult.isError) {
-      const message =
-        globResult.error instanceof Error
-          ? globResult.error.message
-          : "The file search request failed."
+    if (findResult.isError) {
+      const message = describeRequestError(
+        findResult.error,
+        "The file search request failed.",
+      )
       setSearchError(debouncedQuery, driveId, message)
       return
     }
-    if (globResult.isSuccess) {
-      const matches = globResult.data.matches.map((m) => m.path)
-      setSearchResults(debouncedQuery, driveId, matches)
+    if (findResult.isSuccess) {
+      const matches = findResult.data.matches.map((m) => m.path)
+      setSearchResults(debouncedQuery, driveId, matches, findResult.data.total)
     }
   }, [
     tab,
     query,
     debouncedQuery,
     driveId,
-    globResult.data,
-    globResult.error,
-    globResult.isError,
-    globResult.isFetching,
-    globResult.isSuccess,
+    findResult.data,
+    findResult.error,
+    findResult.isError,
+    findResult.isFetching,
+    findResult.isSuccess,
   ])
 
   // Always clear the filter on unmount so the tree returns to normal.
@@ -114,6 +115,12 @@ export function SearchBar() {
     setModalQuery(seed)
     setModalOpen(true)
   }, [])
+
+  // The tree's "no matches" state offers content search with the same query.
+  useEffect(() => {
+    registerContentSearch(openSearchModal)
+    return () => registerContentSearch(null)
+  }, [registerContentSearch, openSearchModal])
 
   /**
    * Switching to the "Search" tab opens a self-contained modal — full-text
@@ -155,12 +162,17 @@ export function SearchBar() {
         return
       }
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-        // While typing in Files-mode search, ↓/↑ jump focus into the filtered
-        // tree so the user can step through matches without grabbing the
-        // mouse. The tree's own handler then takes over.
+        // While typing in Files-mode search, ↓/↑ jump focus into the search
+        // results (or the tree when there are none) so the user can step
+        // through matches without grabbing the mouse. The list's own handler
+        // then takes over.
         if (tab !== "files") return
         const sidebar = e.currentTarget.closest("aside") ?? document
-        const buttons = sidebar.querySelectorAll<HTMLButtonElement>("[data-tree-path]")
+        const results = sidebar.querySelectorAll<HTMLButtonElement>("[data-search-result]")
+        const buttons =
+          results.length > 0
+            ? results
+            : sidebar.querySelectorAll<HTMLButtonElement>("[data-tree-path]")
         if (buttons.length === 0) return
         e.preventDefault()
         const target = e.key === "ArrowDown" ? buttons[0] : buttons[buttons.length - 1]

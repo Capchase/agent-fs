@@ -91,8 +91,11 @@ export const files = sqliteTable(
       .notNull()
       .default(false),
     embeddingStatus: text("embedding_status", {
-      enum: ["pending", "indexed", "failed"],
+      enum: ["pending", "indexed", "failed", "skipped"],
     }).default("pending"),
+    imageEmbeddingStatus: text("image_embedding_status", {
+      enum: ["pending", "indexed", "failed"],
+    }),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.path, table.driveId] }),
@@ -142,6 +145,12 @@ export const comments = sqliteTable("comments", {
   lineStart: integer("line_start"),
   lineEnd: integer("line_end"),
   quotedContent: text("quoted_content"),
+  // Text-quote anchor (exact selection + surrounding context). Nullable:
+  // comments created before these columns, or by clients that don't send a
+  // quote, fall back to lineStart/lineEnd + quotedContent.
+  quoteExact: text("quote_exact"),
+  quotePrefix: text("quote_prefix"),
+  quoteSuffix: text("quote_suffix"),
   fileVersionId: integer("file_version_id"),
   body: text("body").notNull(),
   author: text("author")
@@ -154,6 +163,24 @@ export const comments = sqliteTable("comments", {
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
   isDeleted: integer("is_deleted", { mode: "boolean" }).notNull().default(false),
 });
+
+// comment_mentions (targeted comment mentions)
+export const commentMentions = sqliteTable(
+  "comment_mentions",
+  {
+    commentId: text("comment_id")
+      .notNull()
+      .references(() => comments.id),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.commentId, table.userId] }),
+    userIdx: index("idx_comment_mentions_user").on(table.userId),
+  })
+);
 
 // events (generic event/notification table)
 export const events = sqliteTable(
@@ -198,11 +225,73 @@ export const contentChunks = sqliteTable(
     content: text("content").notNull(),
     charOffset: integer("char_offset").notNull(),
     tokenCount: integer("token_count").notNull(),
+    page: integer("page"),
+    kind: text("kind", { enum: ["text", "image"] }).notNull().default("text"),
   },
   (table) => ({
     drivePathIdx: index("idx_content_chunks_drive_path").on(
       table.driveId,
       table.filePath
     ),
+  })
+);
+
+// shares (public /share/:token links)
+// Only the SHA-256 of the token is stored. No FKs on purpose: a share must
+// never block deleting a user, drive or org (same reasoning as file_versions).
+export const shares = sqliteTable(
+  "shares",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    driveId: text("drive_id").notNull(),
+    path: text("path").notNull(),
+    /** `file` = one file at `path`; `site` = the folder at `path`, served under /site/<token>/. */
+    kind: text("kind", { enum: ["file", "site"] }).notNull().default("file"),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    maxViews: integer("max_views"),
+    views: integer("views").notNull().default(0),
+    lastViewedAt: integer("last_viewed_at", { mode: "timestamp" }),
+    createdBy: text("created_by").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+    revokedAt: integer("revoked_at", { mode: "timestamp" }),
+  },
+  (table) => ({
+    tokenHashUq: uniqueIndex("shares_token_hash_uq").on(table.tokenHash),
+    drivePathIdx: index("idx_shares_drive_path").on(table.driveId, table.path),
+  })
+);
+
+// favorites: per-user stars on files and folders. See raw.ts.
+export const favorites = sqliteTable(
+  "favorites",
+  {
+    userId: text("user_id").notNull(),
+    driveId: text("drive_id").notNull(),
+    path: text("path").notNull(),
+    kind: text("kind", { enum: ["file", "directory"] }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.userId, table.driveId, table.path] }),
+    drivePathIdx: index("idx_favorites_drive_path").on(table.driveId, table.path),
+  })
+);
+
+// share_view_grants: the credential a counted page view of a view-limited
+// share hands to that page for its byte fetches (/raw, /download). Only the
+// SHA-256 of the grant is stored. No FKs, same reasoning as `shares`.
+export const shareViewGrants = sqliteTable(
+  "share_view_grants",
+  {
+    grantHash: text("grant_hash").primaryKey(),
+    shareId: text("share_id").notNull(),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => ({
+    shareIdx: index("idx_share_view_grants_share").on(table.shareId),
+    expiryIdx: index("idx_share_view_grants_expiry").on(table.expiresAt),
   })
 );

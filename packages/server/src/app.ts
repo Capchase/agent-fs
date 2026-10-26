@@ -2,33 +2,38 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { VERSION, getConfig, DEFAULT_MAX_UPLOAD_BYTES } from "@/core";
+import { VERSION, getConfig, DEFAULT_MAX_UPLOAD_BYTES, PresenceRegistry, getProfile } from "@/core";
 import type { DB, StorageAdapter, EmbeddingProvider } from "@/core";
 import { createMcpServer } from "@/mcp/server.js";
 import type { AppEnv } from "./types.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { handleError } from "./middleware/error.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
+import { resolveApiUrl } from "./public-url.js";
 import { requestLogMiddleware } from "./middleware/request-log.js";
 import { authRoutes } from "./routes/auth.js";
 import { opsRoutes } from "./routes/ops.js";
 import { orgRoutes } from "./routes/orgs.js";
 import { docsRoutes } from "./routes/docs.js";
 import { fileRoutes } from "./routes/files.js";
+import { presenceRoutes } from "./routes/presence.js";
+import { eventRoutes } from "./routes/events.js";
+import { shareRoutes } from "./routes/share.js";
+import { siteRoutes } from "./routes/site.js";
+import { SERVER_FEATURES } from "./features.js";
 
 export function createApp(db: DB, s3: StorageAdapter, embeddingProvider: EmbeddingProvider | null = null) {
   const app = new Hono<AppEnv>();
   const config = getConfig();
+  const presence = new PresenceRegistry({ getDisplayName: (userId) => getProfile(db, userId).displayName });
 
   const maxUploadBytes = config.server.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES;
 
-  // CORS — configurable origins
+  // CORS — configurable origins. /site sets its own CORS headers (pages run in
+  // an opaque origin, so they need `*` whatever this list says).
   const origins = config.server?.cors?.origins ?? ["*"];
-  if (origins.length === 1 && origins[0] === "*") {
-    app.use("*", cors());
-  } else {
-    app.use("*", cors({ origin: origins }));
-  }
+  const corsMiddleware = origins.length === 1 && origins[0] === "*" ? cors() : cors({ origin: origins });
+  app.use("*", (c, next) => (isSitePath(c.req.path) ? next() : corsMiddleware(c, next)));
 
   app.use("*", requestLogMiddleware());
   app.use("*", (c, next) => {
@@ -44,21 +49,43 @@ export function createApp(db: DB, s3: StorageAdapter, embeddingProvider: Embeddi
       }, 413),
     })(c, next);
   });
+
+  // Public share links: the token is the only credential, so this mounts before
+  // authMiddleware and brings its own per-IP rate limit.
+  app.route("/share", shareRoutes(db, s3, {
+    requestsPerMinute: config.server?.shareRateLimit?.requestsPerMinute ?? 120,
+  }));
+
+  // Public site shares (a shared folder served at /site/<token>/): same idea,
+  // with a higher limit because one page load fetches many files.
+  app.route("/site", siteRoutes(db, s3, {
+    requestsPerMinute: config.server?.siteRateLimit?.requestsPerMinute ?? 600,
+  }));
+
   app.use("*", authMiddleware(db));
 
-  // Rate limiting (default 1200 rpm per API key, override via AGENT_FS_RATE_LIMIT) — skip /health
-  const rpm = config.server?.rateLimit?.requestsPerMinute ?? 1200;
+  // Rate limiting (default 3000 rpm per API key, override via AGENT_FS_RATE_LIMIT) — skip /health
+  const rpm = config.server?.rateLimit?.requestsPerMinute ?? 3000;
   if (rpm > 0) {
-    app.use("/orgs/*", rateLimitMiddleware(rpm));
+    const generalLimiter = rateLimitMiddleware(rpm);
+    app.use("/orgs/*", (c, next) => isPresencePath(c.req.path) ? next() : generalLimiter(c, next));
     app.use("/auth/*", rateLimitMiddleware(rpm));
     app.use("/mcp", rateLimitMiddleware(rpm));
+  }
+
+  const presenceRpm = config.server?.presenceRateLimit?.requestsPerMinute ?? 1200;
+  if (presenceRpm > 0) {
+    const presenceLimiter = rateLimitMiddleware(presenceRpm);
+    app.use("/orgs/*", (c, next) => isPresencePath(c.req.path) ? presenceLimiter(c, next) : next());
   }
 
   // Error handler
   app.onError((err, c) => handleError(err, c));
 
   // Health check
-  app.get("/health", (c) => c.json({ ok: true, version: VERSION, maxUploadBytes }));
+  // `features` lets clients (the live UI) detect newer capabilities without
+  // probing: an older server simply omits the field.
+  app.get("/health", (c) => c.json({ ok: true, version: VERSION, maxUploadBytes, features: [...SERVER_FEATURES] }));
 
   // MCP endpoint — per-request stateless transport
   app.all("/mcp", async (c) => {
@@ -69,7 +96,13 @@ export function createApp(db: DB, s3: StorageAdapter, embeddingProvider: Embeddi
       enableJsonResponse: true,
     });
 
-    const mcpServer = createMcpServer({ db, s3, embeddingProvider, appUrl: config.appUrl });
+    const mcpServer = createMcpServer({
+      db,
+      s3,
+      embeddingProvider,
+      appUrl: config.appUrl,
+      apiUrl: resolveApiUrl(c, config.server?.publicUrl),
+    });
     await mcpServer.connect(transport);
 
     return transport.handleRequest(c.req.raw, {
@@ -85,9 +118,20 @@ export function createApp(db: DB, s3: StorageAdapter, embeddingProvider: Embeddi
   // Routes
   app.route("/auth", authRoutes(db));
   app.route("/orgs", orgRoutes(db));
-  app.route("/orgs", opsRoutes(db, s3, embeddingProvider, config.appUrl));
+  app.route("/orgs", opsRoutes(db, s3, embeddingProvider, config.appUrl, config.server?.publicUrl));
   app.route("/docs", docsRoutes());
   app.route("/orgs", fileRoutes(db, s3, embeddingProvider, config.appUrl));
+  app.route("/orgs", eventRoutes(db, undefined, presence));
+
+  app.route("/orgs", presenceRoutes(db, presence));
 
   return app;
+}
+
+function isSitePath(path: string): boolean {
+  return path === "/site" || path.startsWith("/site/");
+}
+
+function isPresencePath(path: string): boolean {
+  return /^\/orgs\/[^/]+\/drives\/[^/]+\/presence(?:\/[^/]+)?$/.test(path);
 }

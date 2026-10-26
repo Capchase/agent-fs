@@ -8,6 +8,7 @@ import { AddComment } from "@/components/comments/AddComment"
 import { MermaidDiagram } from "./MermaidDiagram"
 import { MarkdownImage, MarkdownDocContext } from "./MarkdownImage"
 import { CodeBlock } from "./CodeBlock"
+import { MarkdownPresence } from "@/components/presence/MarkdownPresence"
 import { Button } from "@/components/ui/button"
 import {
   Tooltip,
@@ -23,9 +24,14 @@ import {
 import { useLocalStorage } from "@/hooks/use-local-storage"
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts"
 import { Kbd } from "@/components/ui/kbd"
-import { slugify, scrollToHeading, type OutlineItem } from "@/lib/outline"
+import { slugify, scrollToHeading, scrollBehavior, type OutlineItem } from "@/lib/outline"
 import { computeActiveHeadings } from "@/hooks/use-active-headings"
-import type { CommentListEntry } from "@/api/types"
+import { useCommentAnchors } from "@/hooks/use-comment-anchors"
+import { captureQuote, type AnchorResolution } from "@/lib/comment-anchor"
+import { buildDomTextSpace, rehypeSourceLines, type DomTextSpace } from "@/lib/dom-text-space"
+import { commentAnchors, revealComment, useActiveComment, useHoveredComment } from "@/stores/comment-anchors"
+import { toast } from "@/stores/toast"
+import type { CommentListEntry, CommentQuote } from "@/api/types"
 import type { ScrollToCommentCallback } from "@/pages/FileBrowser"
 
 function extractMermaidCode(children: ReactNode): string | null {
@@ -50,7 +56,7 @@ const markdownComponents: Components = {
   },
   pre({ node: _node, ...props }) {
     const code = extractMermaidCode(props.children)
-    if (code !== null) return <MermaidDiagram code={code} />
+    if (code !== null) return <MermaidDiagram {...props} code={code} />
     return <CodeBlock {...props} />
   },
   img({ src, alt, title }) {
@@ -174,6 +180,20 @@ const COMMENT_FORM_WIDTH = 320
 const COMMENT_BTN_WIDTH = 108
 const COMMENT_BTN_HEIGHT = 32
 
+// CSS Custom Highlight API: paints exact text ranges without touching the DOM
+// (wrapping text in elements would break native selection). Older browsers
+// fall back to marking the containing blocks.
+const supportsHighlights = typeof CSS !== "undefined" && "highlights" in CSS && typeof Highlight !== "undefined"
+const HIGHLIGHT_NAMES = ["comment-anchor", "comment-anchor-moved", "comment-anchor-active"] as const
+
+/** The anchor + source lines of a new comment's target. */
+interface CommentTarget {
+  text: string
+  quote?: CommentQuote
+  lineStart?: number
+  lineEnd?: number
+}
+
 /** Clamp an x-coordinate so a box of the given width stays on screen. */
 function clampLeft(left: number, width: number): number {
   const max = window.innerWidth - width - VIEWPORT_MARGIN
@@ -203,7 +223,7 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
   const contentRef = useRef<HTMLDivElement>(null)
   // Selected text + the live anchor rect that tracks it (recomputed on scroll
   // so the comment UI stays glued to the selection).
-  const [selection, setSelection] = useState<{ text: string } | null>(null)
+  const [selection, setSelection] = useState<CommentTarget | null>(null)
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
   const anchorRectFnRef = useRef<(() => DOMRect | null) | null>(null)
   const [showCommentForm, setShowCommentForm] = useState(false)
@@ -216,6 +236,8 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
   const [outlineMenuOpen, setOutlineMenuOpen] = useState(false)
   const [mobileActiveId, setMobileActiveId] = useState<string | null>(null)
   const { frontmatter, body } = useMemo(() => extractFrontmatter(content), [content])
+  // Source lines taken by the frontmatter, so rendered blocks map to file lines.
+  const lineOffset = useMemo(() => content.slice(0, content.length - body.length).split("\n").length - 1, [content, body])
 
   // Memoise the rendered markdown so high-frequency state updates (e.g. the
   // comment box tracking the selection on scroll) don't force react-markdown to
@@ -224,14 +246,32 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
     () => (
       <Markdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }], rehypeSourceLines(lineOffset)]}
         components={markdownComponents}
       >
         {body}
       </Markdown>
     ),
-    [body],
+    [body, lineOffset],
   )
+
+  // Text of the rendered document, rebuilt when the markdown re-renders, used
+  // to resolve comment anchors to exact DOM ranges.
+  const [domSpace, setDomSpace] = useState<DomTextSpace | null>(null)
+  useEffect(() => {
+    if (!contentRef.current || !comments?.length) {
+      setDomSpace(null)
+      return
+    }
+    setDomSpace(buildDomTextSpace(contentRef.current))
+  }, [renderedMarkdown, frontmatter, comments?.length])
+  const anchors = useCommentAnchors(path, comments, domSpace)
+  const anchorsRef = useRef(anchors)
+  anchorsRef.current = anchors
+  const hovered = useHoveredComment()
+  const active = useActiveComment()
+  // Resolved DOM ranges, for hover hit-testing.
+  const anchorRangesRef = useRef(new Map<string, Range>())
 
   // `w` toggles reading vs full width (only while a markdown preview is mounted).
   useKeyboardShortcuts({
@@ -241,10 +281,24 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
     },
   })
 
-  // Scroll to comment: find matching text in preview and scroll + flash
+  // Scroll to comment: scroll to its resolved range and flash its blocks.
+  // Falls back to the legacy quote scan when there's no resolution for it.
   if (onScrollToCommentRef) {
-    onScrollToCommentRef.current = ({ quotedContent }) => {
-      if (!quotedContent || !contentRef.current) return
+    onScrollToCommentRef.current = ({ quotedContent, commentId }) => {
+      if (!contentRef.current) return
+      const resolved = commentId ? anchorsRef.current.get(commentId) : undefined
+      if (resolved && domSpace) {
+        if (resolved.start == null || resolved.end == null) {
+          toast("The text this comment pointed to is no longer in the file")
+          return
+        }
+        const blocks = domSpace.blocksFor(resolved.start, resolved.end, resolved)
+        const target = blocks[0] ?? domSpace.toRange(resolved.start, resolved.end)?.startContainer.parentElement
+        target?.scrollIntoView({ behavior: scrollBehavior(), block: "center" })
+        flashBlocks(blocks, "flash-comment-highlight", 2000)
+        return
+      }
+      if (!quotedContent) return
       const needle = quotedContent.trim().toLowerCase().slice(0, 40)
       const walker = document.createTreeWalker(contentRef.current, NodeFilter.SHOW_ELEMENT)
       let node: Node | null = walker.currentNode
@@ -252,7 +306,7 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
         const el = node as HTMLElement
         const text = el.textContent?.trim().toLowerCase() ?? ""
         if (text.includes(needle) && el.children.length === 0) {
-          el.scrollIntoView({ behavior: "smooth", block: "center" })
+          el.scrollIntoView({ behavior: scrollBehavior(), block: "center" })
           el.classList.add("flash-comment-highlight")
           setTimeout(() => el.classList.remove("flash-comment-highlight"), 2000)
           return
@@ -285,28 +339,103 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
     onOutlineChange?.(items)
   }, [body, onOutlineChange])
 
-  // Post-render: scan DOM and add highlight classes to elements matching comments
-  // This avoids wrapping elements with React components (which kills native selection)
+  // Paint each comment's resolved range. The hovered or revealed comment is
+  // emphasized, and pulses when hovered from its sidebar card.
   useEffect(() => {
-    const container = contentRef.current
-    if (!container || !comments?.length) return
+    const ranges = new Map<string, Range>()
+    anchorRangesRef.current = ranges
+    if (!domSpace || !anchors.size) return
 
-    const commentableSelectors = "p, h1, h2, h3, h4, h5, h6, li, blockquote"
-    const elements = container.querySelectorAll(commentableSelectors)
-    const highlightClass = "comment-indicator"
-
-    elements.forEach((el) => {
-      const text = el.textContent?.trim().toLowerCase() ?? ""
-      const hasMatch = comments.some(c =>
-        c.quotedContent && text.includes(c.quotedContent.trim().toLowerCase().slice(0, 40))
-      )
-      el.classList.toggle(highlightClass, hasMatch)
+    const marked: Element[] = []
+    const groups: Record<(typeof HIGHLIGHT_NAMES)[number], Range[]> = {
+      "comment-anchor": [],
+      "comment-anchor-moved": [],
+      "comment-anchor-active": [],
+    }
+    anchors.forEach((r: AnchorResolution, id) => {
+      if (r.start == null || r.end == null) return
+      const range = domSpace.toRange(r.start, r.end)
+      if (!range) return
+      ranges.set(id, range)
+      groups[r.status === "moved" ? "comment-anchor-moved" : "comment-anchor"].push(range)
+      if (hovered?.id === id || active === id) groups["comment-anchor-active"].push(range)
+      if (!supportsHighlights) {
+        for (const el of domSpace.blocksFor(r.start, r.end, r)) {
+          el.classList.add("comment-indicator")
+          marked.push(el)
+        }
+      }
     })
 
-    return () => {
-      elements.forEach((el) => el.classList.remove(highlightClass))
+    if (supportsHighlights) {
+      for (const name of HIGHLIGHT_NAMES) {
+        const hl = new Highlight(...groups[name])
+        if (name === "comment-anchor-active") hl.priority = 1
+        CSS.highlights.set(name, hl)
+      }
     }
-  }, [comments])
+
+    const pulse = hovered?.source === "card" ? anchors.get(hovered.id) : undefined
+    const pulseTimer = pulse?.start != null && pulse.end != null
+      ? flashBlocks(domSpace.blocksFor(pulse.start, pulse.end, pulse), "comment-pulse", 900)
+      : undefined
+
+    return () => {
+      if (supportsHighlights) for (const name of HIGHLIGHT_NAMES) CSS.highlights.delete(name)
+      for (const el of marked) el.classList.remove("comment-indicator")
+      pulseTimer?.()
+    }
+  }, [domSpace, anchors, hovered, active])
+
+  // Hovering a highlighted range pulses its sidebar card. Clicking it scrolls
+  // the card into view.
+  useEffect(() => {
+    const container = contentRef.current
+    if (!container || !anchors.size) return
+    // Innermost (shortest) comment range under the point, if any.
+    const hitTest = (x: number, y: number) => {
+      let hit: string | null = null
+      let hitLen = Infinity
+      anchorRangesRef.current.forEach((range, id) => {
+        const len = range.toString().length
+        if (len >= hitLen) return
+        for (const rect of range.getClientRects()) {
+          if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+            hit = id
+            hitLen = len
+            break
+          }
+        }
+      })
+      return hit
+    }
+    let raf = 0
+    const onMove = (e: MouseEvent) => {
+      if (raf) return
+      const { clientX: x, clientY: y } = e
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        commentAnchors.setHovered(hitTest(x, y), "doc")
+      })
+    }
+    const onLeave = () => commentAnchors.setHovered(null, "doc")
+    const onClick = (e: MouseEvent) => {
+      // A drag that selected text starts a new comment instead.
+      if (window.getSelection()?.isCollapsed === false) return
+      const hit = hitTest(e.clientX, e.clientY)
+      if (hit) revealComment(hit)
+    }
+    container.addEventListener("mousemove", onMove)
+    container.addEventListener("mouseleave", onLeave)
+    container.addEventListener("click", onClick)
+    return () => {
+      container.removeEventListener("mousemove", onMove)
+      container.removeEventListener("mouseleave", onLeave)
+      container.removeEventListener("click", onClick)
+      if (raf) cancelAnimationFrame(raf)
+      commentAnchors.setHovered(null, "doc")
+    }
+  }, [anchors.size])
 
   // Track hovered element for the + button
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -354,10 +483,10 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
   }, [showCommentForm, selection])
 
   /** Begin a comment anchored to a DOM rect source (text range or element). */
-  const beginComment = useCallback((text: string, getRect: () => DOMRect | null) => {
+  const beginComment = useCallback((target: CommentTarget, getRect: () => DOMRect | null) => {
     anchorRectFnRef.current = getRect
     const rect = getRect()
-    setSelection({ text })
+    setSelection(target)
     if (rect) setAnchorRect(rect)
     setHoverComment(null)
   }, [])
@@ -390,7 +519,10 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
 
     // Clone the range so the anchor rect can be recomputed as the user scrolls.
     const range = sel.getRangeAt(0).cloneRange()
-    beginComment(text, () => range.getBoundingClientRect())
+    beginComment(
+      targetFromDom(contentRef.current, text, range.startContainer, range.startOffset, range.endContainer, range.endOffset),
+      () => range.getBoundingClientRect(),
+    )
   }, [beginComment])
 
   // Keep the comment UI glued to the selection while the document scrolls or
@@ -515,7 +647,7 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
       <div
         ref={contentRef}
         data-markdown-scroll
-        className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-6 py-8 lg:px-12"
+        className="relative min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-6 py-8 lg:px-12"
         onMouseUp={handleMouseUp}
       >
         <div
@@ -529,6 +661,7 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
             {renderedMarkdown}
           </MarkdownDocContext.Provider>
         </div>
+        <MarkdownPresence containerRef={contentRef} path={path} content={content} />
       </div>
 
       {/* Hover comment button on left margin */}
@@ -538,10 +671,14 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => {
             const el = hoverComment.el
-            beginComment(hoverComment.text, () => el.getBoundingClientRect())
+            const root = contentRef.current
+            beginComment(
+              root ? targetFromDom(root, hoverComment.text, el, 0, el, el.childNodes.length) : { text: hoverComment.text },
+              () => el.getBoundingClientRect(),
+            )
             setShowCommentForm(true)
           }}
-          className="fixed z-40 flex items-center justify-center size-6 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20 transition-all"
+          className="fixed z-40 flex items-center justify-center size-6 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
           style={{
             top: hoverComment.rect.top + 2,
             left: Math.max(VIEWPORT_MARGIN, hoverComment.rect.left - 32),
@@ -582,7 +719,10 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
         >
           <AddComment
             path={path}
+            lineStart={selection.lineStart}
+            lineEnd={selection.lineEnd}
             quotedContent={selection.text.slice(0, 200)}
+            quote={selection.quote}
             autoFocus
             onDone={clearComment}
           />
@@ -596,4 +736,31 @@ export function MarkdownViewer({ content, path, comments, className, onScrollToC
       )}
     </div>
   )
+}
+
+/**
+ * Anchor data for a new comment on the DOM range [start, end): the quote with
+ * context from the rendered text, and the source lines of the blocks it spans.
+ */
+function targetFromDom(root: HTMLElement, text: string, startNode: Node, startOffset: number, endNode: Node, endOffset: number): CommentTarget {
+  const space = buildDomTextSpace(root)
+  const start = space.pointToOffset(startNode, startOffset)
+  const end = space.pointToOffset(endNode, endOffset)
+  if (start == null || end == null || end <= start) return { text }
+  const quote = captureQuote(space.text, start, end)
+  const lineStart = space.offsetToLine(start) ?? undefined
+  const lineEnd = space.offsetToLine(end - 1) ?? undefined
+  return { text, quote, lineStart, lineEnd: lineStart != null ? Math.max(lineStart, lineEnd ?? lineStart) : undefined }
+}
+
+/** Add a class to elements for `ms`; returns a function that removes it early. */
+function flashBlocks(els: Element[], className: string, ms: number): () => void {
+  for (const el of els) {
+    el.classList.remove(className)
+    void (el as HTMLElement).offsetWidth // restart the animation
+    el.classList.add(className)
+  }
+  const clear = () => els.forEach((el) => el.classList.remove(className))
+  const timer = setTimeout(clear, ms)
+  return () => { clearTimeout(timer); clear() }
 }

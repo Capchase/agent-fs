@@ -1,6 +1,6 @@
 {
   "name": "@desplega.ai/agent-fs-core",
-  "version": "0.13.10",
+  "version": "0.18.6",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -9,13 +9,14 @@
     "@aws-sdk/s3-request-presigner": "^3.750.0",
     "@duckdb/node-api": "1.5.3-r.3",
     "@google/genai": "^1.45.0",
-    "chonkie": "^0.3.0",
+    "@chonkiejs/core": "0.0.12",
     "diff": "^8.0.3",
     "drizzle-orm": "^0.44.0",
-    "files-sdk": "^2.0.0",
+    "files-sdk": "^3.1.1",
     "node-llama-cpp": "^3.17.1",
     "openai": "^6.29.0",
     "sqlite-vec": "^0.1.9",
+    "unpdf": "1.9.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {

@@ -43,7 +43,9 @@ The daemon serves both the HTTP REST API and the MCP endpoint on `127.0.0.1:7433
 
 ## 2. Single Developer, Remote S3
 
-Use Cloudflare R2, AWS S3, or any S3-compatible storage instead of local MinIO.
+Use Cloudflare R2, AWS S3, Tigris, or any S3-compatible storage instead of local MinIO.
+
+agent-fs talks to every remote store through its S3 client (AWS SDK v3), so a store works only if it offers an S3-compatible API. The local filesystem backend (`agent-fs onboard --filesystem`) is the one exception: it stores files through the [files-sdk](https://github.com/haydenbleasel/files-sdk) `fs` adapter. agent-fs does not use files-sdk's other provider adapters, so stores with only a native API, such as Convex File Storage, are not supported.
 
 ### Setup
 
@@ -66,6 +68,10 @@ agent-fs config set s3.region "auto"
 | **Cloudflare R2** | `https://<account>.r2.cloudflarestorage.com` | `auto` | `true` |
 | **AWS S3** | `https://s3.<region>.amazonaws.com` | your region | `false` |
 | **DigitalOcean Spaces** | `https://<region>.digitaloceanspaces.com` | your region | `false` |
+| **Tigris** | `https://t3.storage.dev` | `auto` | `false` |
+| **Bunny Storage** (S3 API, preview) | `https://<region>-s3.storage.bunnycdn.com` | your region code (e.g. `de`) | `true` |
+
+These rows come from each provider's S3 documentation: [Tigris](https://www.tigrisdata.com/docs/sdks/s3/aws-js-sdk/), [Bunny Storage](https://bunny.net/docs/storage/s3). Bunny Storage enables its S3 API only on a new storage zone and does not support object versioning, so there `revert` returns `UNSUPPORTED_OPERATION` and `diff` falls back to the stored change summary. Tigris is the default storage for the [Fly.io deploy](https://github.com/desplega-ai/agent-fs/blob/main/DEPLOYMENT.md).
 
 ### S3 Versioning
 
@@ -133,6 +139,7 @@ Key rules:
 
 - **Drive membership is explicit.** A drive is only visible and usable for users with a drive membership row. New drives grant the creator admin membership automatically; invite other users per drive (or rely on org-invite's default-drive grant).
 - **Member management is admin-only.** Inviting, listing, updating, and removing org members requires org `admin`. Managing drive members requires drive `admin` or admin of the owning org. Creating drives in an org requires org `admin`.
+- **Drive member listing is viewer-level.** Every drive member can list drive member emails and display names with `drive-members`. Roles stay admin-only.
 - **Write paths all enforce editor-or-better** — the JSON ops route, the binary `PUT /raw` route, and FUSE mounts share the same check. Viewers can read everywhere they're a member but cannot write through any surface.
 - **Org/drive IDs are bound.** A request that addresses a drive under the wrong org — or any org/drive the caller has no membership in — returns `404`, indistinguishable from a nonexistent ID.
 
@@ -181,9 +188,28 @@ Semantic search requires an embedding provider. Configure via environment variab
 |----------|-------------|------|-------|
 | **OpenAI** | `OPENAI_API_KEY` | ~$0.02/1M tokens | Best quality, requires API key |
 | **Google Gemini** | `GEMINI_API_KEY` | Free tier available | Good quality, generous free tier |
-| **Local (llama.cpp)** | — | Free | Requires local model download, slower |
+| **Local** | None | Free | Runs nomic-embed-text-v1.5 on llama.cpp or EmbeddingGemma 2 on transformers.js. Requires a model download. |
 
-Priority: environment variable > `config.json` > none (semantic search disabled).
+Priority: an explicit `EMBEDDING_PROVIDER` (`local`, `openai`, or `gemini`) > `OPENAI_API_KEY` > `GEMINI_API_KEY` > `config.json` > none (semantic search disabled). An explicit `openai` or `gemini` takes its key from `EMBEDDING_API_KEY` or `config.json` first, then from its own API key variable.
+
+When `EMBEDDING_PROVIDER` names another provider than config.json, agent-fs does not use the model and API key from config.json. `EMBEDDING_MODEL` and `EMBEDDING_API_KEY` still apply.
+
+### Text embedding size cap
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `AGENT_FS_EMBEDDING_MAX_BYTES` | No cap | Positive integer limit for text embeddings, in UTF-8 bytes after base64 stripping (except PDF text). Unset or invalid means no cap. Restart after changes. |
+| `AGENT_FS_EMBEDDING_EXCLUDE_DRIVES` | No exclusion | Comma-separated drive IDs. The parser trims IDs and ignores empty entries. Excluded drives keep FTS and lose text and image vectors. Text reports `skipped`. Restart after changes. |
+
+The cap measures text after base64 stripping.
+PDF text keeps base64 to preserve page offsets.
+Text over the cap keeps its full-text search index.
+The indexer deletes its text chunks and vectors and reports `embeddingStatus: "skipped"`.
+Image and PDF-page embeddings stay unchanged.
+At boot, a changed cap queues skipped files and indexed files larger than the new cap.
+This check uses original FTS bytes and can queue extra files that contain base64.
+`reindex` skips files with `skipped` status, as it skips files with `indexed` status.
+`stat`, CLI, MCP, and the live file metadata show `skipped`.
 
 ### Configuring in config.json
 
@@ -222,6 +248,48 @@ The config file lives at `~/.agent-fs/config.json` (or `$AGENT_FS_HOME/config.js
   }
 }
 ```
+
+## Upgrading
+
+### Automatic file path normalization
+
+Versions up to 0.15.x could store a path without its leading slash. For example, `notes.md` and `/notes.md` could exist as two different files. The server now changes every path to the `/` form before it uses it. When the daemon starts, it also rewrites the old bare paths in the database. You do not have to do anything.
+
+What the daemon does at startup, before it accepts requests:
+
+- It finds paths without a leading `/` in files, versions, comments, shares, search chunks, and full-text rows.
+- It renames each bare path to its `/` form.
+- If both forms have history, it merges them into one file. It orders the versions by time and numbers them again. The comments move to the merged file.
+- It keeps the search rows of the newest form. A text file without search rows goes back to `pending`, so the indexer builds them again.
+- It skips a path that has no safe `/` form (a trailing `/` or a `//`). It logs the count and up to 10 examples.
+
+All changes occur in one transaction. On a 1 GB database with about 1,800 bare paths, it took about 4 seconds on a laptop SSD. A slower disk takes longer. The server does not answer `/health` until the migration ends, so give your health check a grace period. After the first run, the check at each start takes milliseconds.
+
+When there is nothing to change, the daemon logs nothing. When it changes data, it logs one line:
+
+```
+file path migration: 62 renamed, 24 merged, 180 versions renumbered, 3 comments remapped, 0 skipped
+```
+
+Before you upgrade:
+
+- Make a backup of `agent-fs.db`. For example: `sqlite3 ~/.agent-fs/agent-fs.db ".backup agent-fs-backup.db"`.
+- To see how many rows have a bare path, run this read-only query:
+
+  ```bash
+  sqlite3 ~/.agent-fs/agent-fs.db "SELECT
+    (SELECT COUNT(*) FROM files WHERE path NOT LIKE '/%') AS files,
+    (SELECT COUNT(*) FROM file_versions WHERE path NOT LIKE '/%') AS versions,
+    (SELECT COUNT(*) FROM comments WHERE path NOT LIKE '/%') AS comments"
+  ```
+
+  If all three counts are `0`, the migration has almost certainly nothing to do.
+
+If the migration fails, the transaction rolls back and the daemon logs `file path migration failed (will retry on next start)`. The daemon then starts normally. Files that are only in the bare form stay hidden until a start completes the migration. The daemon tries again at each start.
+
+If you go back to an older version, it reads the migrated data correctly. If the older version writes new bare paths, the next start of a new version migrates them.
+
+Only the server runs this migration: the local daemon, or the server process in a hosted deployment. `agent-fs init` and the other CLI commands do not change existing paths.
 
 ## Troubleshooting
 

@@ -1,17 +1,17 @@
 /**
- * In-tree filter store. When the user types into the sidebar's "Files" tab,
- * the SearchBar populates this store with the glob-search results. The
- * FileTree reads it and:
- *   - hides any node whose path is neither matched nor an ancestor of a match
- *   - force-expands any folder that has a matching descendant, so the user
- *     sees the path leading to each match without manual expansion
+ * Files-tab search store. When the user types into the sidebar's "Files" tab,
+ * the SearchBar populates this store with the drive-wide `find` results. The
+ * FileTree renders them as a flat result list above the tree, which stays
+ * rendered and unfiltered, so a search costs one request and a failed search
+ * never hides the drive.
  *
  * Four states:
- *   - idle: query is empty → no filter, render the full tree
- *   - loading: a drive-wide glob request is running
- *   - success: glob returned → filter applies; FileTree shows a "no matches"
- *     empty state when matchedPaths is empty
- *   - error: glob failed → show the error without stale results
+ *   - idle: query is empty or too short → no search panel
+ *   - loading: a drive-wide `find` request is running
+ *   - success: `find` returned → FileTree lists matchedPaths (best first), or
+ *     a "no matches" state when it is empty
+ *   - error: `find` failed → FileTree shows the error inline, with Retry and a
+ *     local filter over the folders the tree has already loaded
  */
 
 type Status = "idle" | "loading" | "success" | "error"
@@ -20,7 +20,10 @@ export interface FileSearchState {
   status: Status
   query: string
   driveId: string
+  /** Ranked matches, best first. */
   matchedPaths: readonly string[]
+  /** All matching files on the server, including those past the result cap. */
+  total: number
   error: string | null
 }
 
@@ -29,6 +32,7 @@ const IDLE_STATE: FileSearchState = {
   query: "",
   driveId: "",
   matchedPaths: [],
+  total: 0,
   error: null,
 }
 
@@ -59,21 +63,27 @@ export function setSearchLoading(query: string, driveId: string) {
   ) {
     return
   }
-  snapshot = { status: "loading", query, driveId, matchedPaths: [], error: null }
+  snapshot = { status: "loading", query, driveId, matchedPaths: [], total: 0, error: null }
   emit()
 }
 
-export function setSearchResults(query: string, driveId: string, paths: readonly string[]) {
+export function setSearchResults(
+  query: string,
+  driveId: string,
+  paths: readonly string[],
+  total: number,
+) {
   const normalized = [...new Set(paths.map(normalize))]
   if (
     snapshot.status === "success" &&
     snapshot.query === query &&
     snapshot.driveId === driveId &&
+    snapshot.total === total &&
     pathsEqual(normalized, snapshot.matchedPaths)
   ) {
     return
   }
-  snapshot = { status: "success", query, driveId, matchedPaths: normalized, error: null }
+  snapshot = { status: "success", query, driveId, matchedPaths: normalized, total, error: null }
   emit()
 }
 
@@ -86,7 +96,7 @@ export function setSearchError(query: string, driveId: string, error: string) {
   ) {
     return
   }
-  snapshot = { status: "error", query, driveId, matchedPaths: [], error }
+  snapshot = { status: "error", query, driveId, matchedPaths: [], total: 0, error }
   emit()
 }
 
@@ -105,37 +115,6 @@ function subscribe(callback: () => void): () => void {
 
 function getSnapshot(): FileSearchState {
   return snapshot
-}
-
-/** Filter is active only after a successful request. */
-export function isFilterActive(): boolean {
-  return snapshot.status === "success" && snapshot.query.length > 0
-}
-
-export function isPathMatched(nodePath: string): boolean {
-  if (!isFilterActive()) return false
-  return snapshot.matchedPaths.includes(normalize(nodePath))
-}
-
-export function isPathVisible(nodePath: string): boolean {
-  if (snapshot.status === "idle") return true
-  if (!isFilterActive()) return false
-  const target = normalize(nodePath)
-  for (const m of snapshot.matchedPaths) {
-    if (m === target) return true
-    if (m.startsWith(target + "/")) return true
-  }
-  return false
-}
-
-export function hasMatchingDescendant(nodePath: string): boolean {
-  if (!isFilterActive()) return false
-  const target = normalize(nodePath)
-  for (const m of snapshot.matchedPaths) {
-    if (m === target) continue
-    if (m.startsWith(target + "/")) return true
-  }
-  return false
 }
 
 export const fileSearchStore = {

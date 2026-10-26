@@ -3,6 +3,8 @@ import { schema } from "../db/index.js";
 import type { OpContext } from "./types.js";
 import { stripLeadingSlash } from "./paths.js";
 import { EditConflictError } from "../errors.js";
+import { invalidateDriveGlobListings } from "./glob-cache.js";
+import { publishDriveEvent } from "../events/bus.js";
 
 /**
  * Compute the S3 object key for a file.
@@ -163,6 +165,10 @@ export async function createVersion(
     contentHash?: string;
   }
 ): Promise<number> {
+  // Invalidate after storage writes but before recording the version, so failed
+  // SQLite writes cannot leave a stale listing cached.
+  invalidateDriveGlobListings(ctx.orgId, ctx.driveId);
+
   const version = await getNextVersion(ctx, params.path);
   const now = new Date();
 
@@ -253,6 +259,16 @@ export async function createVersion(
     }
     throw err;
   }
+
+  publishDriveEvent({
+    type: "file.changed",
+    driveId: ctx.driveId,
+    path: params.path,
+    version,
+    operation: params.operation,
+    actor: ctx.userId,
+    at: now.toISOString(),
+  });
 
   return version;
 }

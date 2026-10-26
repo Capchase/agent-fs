@@ -1,19 +1,183 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { createEmbeddingProviderFromEnv } from "../embeddings/index.js";
+import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createEmbeddingProvider, createEmbeddingProviderFromEnv, resolveLocalModel, NOMIC_MODEL, EMBEDDINGGEMMA_MODEL } from "../embeddings/index.js";
+import type { TransformersResult } from "../embeddings/embeddinggemma.js";
+import { OpenAIEmbeddingProvider, requestBatches } from "../embeddings/openai.js";
+import { GeminiEmbeddingProvider } from "../embeddings/gemini.js";
+import { embeddingFormat } from "../embedding-migration.js";
+import { getConfig } from "../../config.js";
+
+const availableTransformers: TransformersResult = { module: true };
+const unavailableTransformers: TransformersResult = { reason: "missing (test)", hint: "Run: bun add -g @huggingface/transformers@4.3.1" };
+
+describe("resolveLocalModel", () => {
+  const cases = [
+    [undefined, false, false, NOMIC_MODEL, "fresh index, transformers unavailable: missing (test)"],
+    [undefined, false, true, EMBEDDINGGEMMA_MODEL, "fresh index"],
+    [undefined, true, false, NOMIC_MODEL, "index built by nomic"],
+    [undefined, true, true, NOMIC_MODEL, "index built by nomic"],
+    ["local:v3", true, false, NOMIC_MODEL, "index built by nomic"],
+    ["local:v3", true, true, NOMIC_MODEL, "index built by nomic"],
+    ["local:v3", false, true, EMBEDDINGGEMMA_MODEL, "fresh index"],
+    ["embeddinggemma:v2", false, false, EMBEDDINGGEMMA_MODEL, "index built by embeddinggemma-2, transformers unavailable: missing (test)"],
+    ["embeddinggemma:v2", false, true, EMBEDDINGGEMMA_MODEL, "index built by embeddinggemma-2"],
+    ["embeddinggemma:v2", true, false, EMBEDDINGGEMMA_MODEL, "index built by embeddinggemma-2, transformers unavailable: missing (test)"],
+    ["embeddinggemma:v2", true, true, EMBEDDINGGEMMA_MODEL, "index built by embeddinggemma-2"],
+    ["openai:v2", true, false, NOMIC_MODEL, "index built by another provider, transformers unavailable: missing (test)"],
+    ["openai:v2", true, true, EMBEDDINGGEMMA_MODEL, "index built by another provider"],
+    ["gemini:v2", false, false, NOMIC_MODEL, "fresh index, transformers unavailable: missing (test)"],
+  ] as [string | undefined, boolean, boolean, string, string][];
+
+  test.each(cases)("format %s, chunks %s, transformers %s", async (storedFormat, hasChunks, available, model, reason) => {
+    const loadTransformers = mock(async () => available ? availableTransformers : unavailableTransformers);
+    const resolved = await resolveLocalModel({ configured: "", storedFormat, hasChunks, loadTransformers });
+    expect(resolved).toMatchObject({ model, reason });
+    if (reason === "index built by nomic") expect(loadTransformers).not.toHaveBeenCalled();
+    else expect(loadTransformers).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([NOMIC_MODEL, EMBEDDINGGEMMA_MODEL, "unknown"])("configured %s overrides the index without a probe", async (configured) => {
+    const loadTransformers = mock(async () => unavailableTransformers);
+    for (const storedFormat of [undefined, "local:v3", "embeddinggemma:v2"]) {
+      expect(await resolveLocalModel({ configured, storedFormat, hasChunks: true, loadTransformers }))
+        .toEqual({ model: configured, reason: "configured" });
+    }
+    expect(loadTransformers).not.toHaveBeenCalled();
+  });
+
+  test("keeps an unavailable reason on one line", async () => {
+    const resolved = await resolveLocalModel({
+      hasChunks: false,
+      loadTransformers: async () => ({ reason: "missing\r\npackage", hint: "" }),
+    });
+    expect(resolved.reason).toBe("fresh index, transformers unavailable: missing package");
+  });
+});
 
 describe("createEmbeddingProviderFromEnv", () => {
-  const originalEnv = { ...process.env };
+  const envKeys = [
+    "AGENT_FS_HOME",
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+  ] as const;
+  let originalEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
-    // Clear embedding-related env vars
-    delete process.env.OPENAI_API_KEY;
-    delete process.env.GEMINI_API_KEY;
+    originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    for (const key of envKeys) delete process.env[key];
   });
 
   afterEach(() => {
-    // Restore original env
-    process.env.OPENAI_API_KEY = originalEnv.OPENAI_API_KEY;
-    process.env.GEMINI_API_KEY = originalEnv.GEMINI_API_KEY;
+    for (const key of envKeys) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+
+  test.each([undefined, "local"])("fresh local index resolves EmbeddingGemma 2 with provider %s", async (explicit) => {
+    if (explicit) process.env.EMBEDDING_PROVIDER = explicit;
+    const log = mock((_message: string) => {});
+    const provider = await createEmbeddingProviderFromEnv({ provider: "local", model: "", apiKey: "" }, {
+      hasChunks: false, loadTransformers: mock(async () => availableTransformers), log,
+    });
+    expect(provider!.name).toBe("embeddinggemma");
+    expect(log).toHaveBeenCalledWith("[agent-fs] local embedding model: embeddinggemma-2 (fresh index)");
+  });
+
+  test.each([
+    [undefined, false, unavailableTransformers, "local", "nomic-embed-text-v1.5 (fresh index, transformers unavailable: missing (test))"],
+    [undefined, true, availableTransformers, "local", "nomic-embed-text-v1.5 (index built by nomic)"],
+    ["local:v3", true, availableTransformers, "local", "nomic-embed-text-v1.5 (index built by nomic)"],
+    ["embeddinggemma:v2", true, unavailableTransformers, "embeddinggemma", "embeddinggemma-2 (index built by embeddinggemma-2, transformers unavailable: missing (test))"],
+  ] as const)("resolves stored format %s with chunks %s", async (storedFormat, hasChunks, transformers, name, line) => {
+    const log = mock((_message: string) => {});
+    const loadTransformers = mock(async () => transformers);
+    const provider = await createEmbeddingProviderFromEnv({ provider: "local", model: "", apiKey: "" }, {
+      storedFormat, hasChunks, loadTransformers, log,
+    });
+    expect(provider!.name).toBe(name);
+    if (hasChunks && (!storedFormat || storedFormat.startsWith("local:"))) expect(loadTransformers).not.toHaveBeenCalled();
+    else expect(loadTransformers).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]).toEqual([`[agent-fs] local embedding model: ${line}`]);
+    if ("hint" in transformers && line.includes("transformers unavailable")) {
+      expect(log.mock.calls[1]).toEqual([transformers.hint]);
+    }
+  });
+
+  test.each(["", NOMIC_MODEL])("config model survives empty env and env nomic wins on a fresh index: %s", async (envModel) => {
+    const home = mkdtempSync(join(tmpdir(), "agent-fs-model-"));
+    try {
+      process.env.AGENT_FS_HOME = home;
+      process.env.EMBEDDING_MODEL = envModel;
+      writeFileSync(join(home, "config.json"), JSON.stringify({ embedding: { provider: "local", model: EMBEDDINGGEMMA_MODEL } }));
+      const log = mock((_message: string) => {});
+      const loadTransformers = mock(async () => availableTransformers);
+      const provider = await createEmbeddingProviderFromEnv(getConfig().embedding, {
+        hasChunks: false, loadTransformers, log,
+      });
+      expect(loadTransformers).not.toHaveBeenCalled();
+      const model = envModel || EMBEDDINGGEMMA_MODEL;
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(provider!.name).toBe(envModel ? "local" : "embeddinggemma");
+      expect(log).toHaveBeenCalledWith(`[agent-fs] local embedding model: ${model} (configured)`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["openai", "gemini"] as const)("%s selection precedes local index resolution", async (providerName) => {
+    const log = mock((_message: string) => {});
+    const loadTransformers = mock(async () => availableTransformers);
+    const index = { hasChunks: false, loadTransformers, log };
+    process.env[providerName === "openai" ? "OPENAI_API_KEY" : "GEMINI_API_KEY"] = "env-key";
+    expect((await createEmbeddingProviderFromEnv({ provider: "local", model: "", apiKey: "" }, index))!.name).toBe(providerName);
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    expect((await createEmbeddingProviderFromEnv({ provider: providerName, model: "", apiKey: "config-key" }, index))!.name).toBe(providerName);
+    process.env.EMBEDDING_PROVIDER = providerName;
+    expect((await createEmbeddingProviderFromEnv({ provider: "local", model: "", apiKey: "config-key" }, index))!.name).toBe(providerName);
+    expect(log).not.toHaveBeenCalled();
+    expect(loadTransformers).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["", "local", "local:v3"],
+    ["nomic-embed-text-v1.5", "local", "local:v3"],
+    ["embeddinggemma-2", "embeddinggemma", "embeddinggemma:v2"],
+  ])("selects local model %s lazily", async (model, name, format) => {
+    const provider = await createEmbeddingProvider({ provider: "local", model, apiKey: "" });
+    expect(provider.name).toBe(name);
+    expect(embeddingFormat(provider)).toBe(format);
+  });
+
+  test.each([true, false])("an unknown local model logs one line with explicit provider %s", async (explicit) => {
+    if (explicit) process.env.EMBEDDING_PROVIDER = "local";
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await createEmbeddingProviderFromEnv({ provider: "local", model: "unknown", apiKey: "" })).toBeNull();
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error.mock.calls[0]).toHaveLength(1);
+      expect(error.mock.calls[0][0]).toContain("Unknown local embedding model: unknown. Use nomic-embed-text-v1.5 or embeddinggemma-2.");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test.each(["openai", "gemini"] as const)("%s ignores the model setting", async (provider) => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect((await createEmbeddingProvider({ provider, model: "unknown", apiKey: "test-key" })).name).toBe(provider);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   test("returns null when no env vars or config", async () => {
@@ -53,5 +217,192 @@ describe("createEmbeddingProviderFromEnv", () => {
     });
     expect(provider).not.toBeNull();
     expect(provider!.name).toBe("openai");
+  });
+
+  test("explicit local overrides OPENAI_API_KEY without loading the model", async () => {
+    process.env.EMBEDDING_PROVIDER = "local";
+    process.env.OPENAI_API_KEY = "sk-test-key";
+    const provider = await createEmbeddingProviderFromEnv();
+    expect(provider!.name).toBe("local");
+    expect(embeddingFormat(provider!)).toBe("local:v3");
+  });
+
+  test("explicit gemini overrides OPENAI_API_KEY", async () => {
+    process.env.EMBEDDING_PROVIDER = "gemini";
+    process.env.OPENAI_API_KEY = "sk-test-key";
+    process.env.GEMINI_API_KEY = "gemini-test-key";
+    const provider = await createEmbeddingProviderFromEnv();
+    expect(provider!.name).toBe("gemini");
+    expect(embeddingFormat(provider!)).toBe("gemini:v2");
+  });
+
+  test("explicit openai uses EMBEDDING_API_KEY through getConfig (the prod setup)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agent-fs-factory-"));
+    try {
+      process.env.AGENT_FS_HOME = home;
+      process.env.EMBEDDING_PROVIDER = "openai";
+      process.env.EMBEDDING_API_KEY = "sk-embedding-key";
+      const provider = await createEmbeddingProviderFromEnv(getConfig().embedding);
+      expect(provider!.name).toBe("openai");
+      expect(provider).toMatchObject({ client: { apiKey: "sk-embedding-key" } });
+      expect(embeddingFormat(provider!)).toBe("openai:v2");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit openai uses a config-only key", async () => {
+    process.env.EMBEDDING_PROVIDER = "openai";
+    const provider = await createEmbeddingProviderFromEnv({
+      provider: "openai",
+      model: "",
+      apiKey: "sk-config-key",
+    });
+    expect(provider!.name).toBe("openai");
+  });
+
+  test.each(["openai", "gemini"] as const)("explicit %s uses config.apiKey before its own env key", async (providerName) => {
+    process.env.EMBEDDING_PROVIDER = providerName;
+    process.env.OPENAI_API_KEY = "sk-env-key";
+    process.env.GEMINI_API_KEY = "gemini-env-key";
+    const provider = await createEmbeddingProviderFromEnv({
+      provider: providerName,
+      model: "",
+      apiKey: "config-key",
+    });
+    expect(provider!.name).toBe(providerName);
+    expect(provider).toMatchObject({ client: { apiKey: "config-key" } });
+  });
+
+  test("explicit openai without a key logs once and returns null", async () => {
+    process.env.EMBEDDING_PROVIDER = "openai";
+    process.env.GEMINI_API_KEY = "gemini-test-key";
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await createEmbeddingProviderFromEnv()).toBeNull();
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledWith(
+        "[agent-fs] EMBEDDING_PROVIDER=openai unavailable: OpenAI API key required. Set embedding.apiKey in config."
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("an empty provider preserves API key precedence", async () => {
+    process.env.EMBEDDING_PROVIDER = "";
+    process.env.OPENAI_API_KEY = "sk-test-key";
+    process.env.GEMINI_API_KEY = "gemini-test-key";
+    expect((await createEmbeddingProviderFromEnv())!.name).toBe("openai");
+  });
+
+  test("explicit OpenRouter uses its own key and configured model", async () => {
+    process.env.EMBEDDING_PROVIDER = "openrouter";
+    process.env.OPENAI_API_KEY = "openai-key";
+    process.env.GEMINI_API_KEY = "gemini-key";
+    process.env.OPENROUTER_API_KEY = "router-key";
+    process.env.EMBEDDING_MODEL = "openai/text-embedding-3-large";
+    const home = mkdtempSync(join(tmpdir(), "agent-fs-openrouter-"));
+    process.env.AGENT_FS_HOME = home;
+    try {
+      const provider = await createEmbeddingProviderFromEnv(getConfig().embedding);
+      expect(provider!.name).toBe("openrouter/openai/text-embedding-3-large");
+      expect(provider).toMatchObject({ client: { apiKey: "router-key", baseURL: "https://openrouter.ai/api/v1" } });
+      process.env.EMBEDDING_API_KEY = "embedding-key";
+      expect(await createEmbeddingProviderFromEnv(getConfig().embedding)).toMatchObject({ client: { apiKey: "embedding-key" } });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("OpenRouter config uses a stored key before its provider environment key", async () => {
+    process.env.OPENROUTER_API_KEY = "router-key";
+    const config = { provider: "openrouter" as const, model: "", apiKey: "config-key" };
+    expect(await createEmbeddingProviderFromEnv(config)).toMatchObject({ client: { apiKey: "config-key" } });
+    expect(await createEmbeddingProviderFromEnv({ ...config, apiKey: "" })).toMatchObject({ client: { apiKey: "router-key" } });
+  });
+
+  test("an OpenRouter key alone does not change automatic provider selection", async () => {
+    process.env.OPENROUTER_API_KEY = "router-key";
+    expect(await createEmbeddingProviderFromEnv()).toBeNull();
+    process.env.OPENAI_API_KEY = "openai-key";
+    expect((await createEmbeddingProviderFromEnv())!.name).toBe("openai");
+  });
+
+  test("explicit OpenRouter without a key does not fall back to OpenAI", async () => {
+    process.env.EMBEDDING_PROVIDER = "openrouter";
+    process.env.OPENAI_API_KEY = "openai-key";
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await createEmbeddingProviderFromEnv()).toBeNull();
+      expect(error.mock.calls[0][0]).toContain("OpenRouter API key required");
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
+describe("provider request inputs", () => {
+  const query = "  Query\nwith Unicode: café  ";
+  const texts = ["  First document\n", "Second document: café  "];
+
+  test("OpenAI sends raw query and document text", async () => {
+    const provider = new OpenAIEmbeddingProvider("sk-test-key");
+    const create = mock(async (_request: unknown) => ({ data: [{ index: 0, embedding: [3, 4] }] }));
+    Object.assign(provider, { client: { embeddings: { create } } });
+
+    expect(await provider.embedQuery(query)).toEqual([3, 4]);
+    expect(await provider.embedDocuments(texts, { title: "file.md" })).toEqual([[3, 4]]);
+    expect(create.mock.calls).toEqual([
+      [{ model: "text-embedding-3-small", input: query, dimensions: 768 }],
+      [{ model: "text-embedding-3-small", input: texts, dimensions: 768 }],
+    ]);
+  });
+
+  test("Gemini sends raw query and document text", async () => {
+    const provider = new GeminiEmbeddingProvider("gemini-test-key");
+    const embedContent = mock(async (_request: unknown) => ({ embeddings: [{ values: [3, 4] }] }));
+    Object.assign(provider, { client: { models: { embedContent } } });
+
+    expect(await provider.embedQuery(query)).toEqual([3, 4]);
+    expect(await provider.embedDocuments(texts, { title: "file.md" })).toEqual([[3, 4], [3, 4]]);
+    expect(embedContent.mock.calls).toEqual([query, ...texts].map((contents) => [{
+      model: "gemini-embedding-001",
+      contents,
+      config: { outputDimensionality: 768 },
+    }]));
+  });
+
+  test("OpenAI splits a large document into requests within its limits, in order", async () => {
+    const provider = new OpenAIEmbeddingProvider("sk-test-key");
+    const create = mock(async (request: { input: string[] }) => ({
+      // Out of order on purpose: the provider sorts by index.
+      data: request.input.map((text, index) => ({ index, embedding: [Number(text)] })).reverse(),
+    }));
+    Object.assign(provider, { client: { embeddings: { create } } });
+
+    // 3,000 chunks of 900 characters: over both the 2,048-input and the token limit of one request.
+    const chunks = Array.from({ length: 3000 }, (_, i) => String(i).padStart(900, "0"));
+    const vectors = await provider.embedDocuments(chunks, { title: "big.csv" });
+
+    expect(vectors).toEqual(chunks.map((_, i) => [i]));
+    const sizes = create.mock.calls.map(([request]) => request.input.length);
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(3000);
+    for (const [request] of create.mock.calls) {
+      expect(request.input.length).toBeLessThanOrEqual(2048);
+      expect(request.input.join("").length).toBeLessThanOrEqual(250_000);
+    }
+  });
+});
+
+describe("requestBatches", () => {
+  test("keeps order and splits on either limit", () => {
+    expect(requestBatches(["a", "b", "c"], { inputs: 2, chars: 100 })).toEqual([["a", "b"], ["c"]]);
+    expect(requestBatches(["aaa", "bb", "c"], { inputs: 10, chars: 5 })).toEqual([["aaa", "bb"], ["c"]]);
+    expect(requestBatches([], { inputs: 2, chars: 5 })).toEqual([]);
+  });
+
+  test("an input over the character budget goes alone, so the provider reports it", () => {
+    expect(requestBatches(["a", "x".repeat(10), "b"], { inputs: 10, chars: 5 })).toEqual([["a"], ["x".repeat(10)], ["b"]]);
   });
 });

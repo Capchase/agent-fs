@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { z } from "zod";
 import {
+  schema,
   getRegisteredOps,
   getOpDefinition,
   createUser,
@@ -19,12 +20,16 @@ import { createTestContext, createTestDb, MockS3Client } from "../../../core/src
 
 describe("registerTools", () => {
   test("registers all ops as MCP tools", () => {
-    const registeredTools: Array<{ name: string; description: string }> = [];
+    const registeredTools: Array<{
+      name: string;
+      description: string;
+      schema: Record<string, unknown>;
+    }> = [];
 
     // Mock McpServer with just the tool() method
     const mockServer = {
-      tool: (name: string, description: string, _schema: any, _handler: any) => {
-        registeredTools.push({ name, description });
+      tool: (name: string, description: string, schema: Record<string, unknown>, _handler: any) => {
+        registeredTools.push({ name, description, schema });
       },
     };
 
@@ -37,6 +42,14 @@ describe("registerTools", () => {
     for (const op of ops) {
       expect(registeredTools.some((t) => t.name === op)).toBe(true);
     }
+
+    for (const tool of registeredTools) {
+      expect(
+        Object.keys(tool.schema).length === 1 && tool.schema.params instanceof z.ZodAny
+      ).toBe(false);
+    }
+    expect(registeredTools.find((tool) => tool.name === "comment-list")?.schema)
+      .toHaveProperty("pathPrefix");
   });
 
   test("tool descriptions are rich descriptions from the registry", () => {
@@ -86,6 +99,46 @@ describe("registerTools", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.version).toBe(1);
     expect(parsed.path).toBe("/mcp-test.txt");
+  });
+
+  test("stat preserves skipped embedding status", async () => {
+    const handlers = new Map<string, (params: any) => Promise<any>>();
+    const mockServer = {
+      tool: (name: string, _description: string, _schema: any, handler: any) => {
+        handlers.set(name, handler);
+      },
+    };
+    const { ctx } = createTestContext();
+    registerTools(mockServer as any, () => ctx);
+    await handlers.get("write")!({ path: "/large.txt", content: "large text" });
+    ctx.db.update(schema.files).set({ embeddingStatus: "skipped" }).run();
+
+    const result = await handlers.get("stat")!({ path: "/large.txt" });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(result.content[0].text).embeddingStatus).toBe("skipped");
+  });
+
+  test("share-create on a folder returns a site share with a /site/ URL", async () => {
+    const handlers = new Map<string, (params: any, extra: any) => Promise<any>>();
+    const mockServer = {
+      tool: (name: string, _desc: string, _schema: any, handler: any) => {
+        handlers.set(name, handler);
+      },
+    };
+
+    const { ctx } = createTestContext();
+    registerTools(mockServer as any, () => ({ ...ctx, apiUrl: "http://127.0.0.1:7433" }));
+
+    const write = handlers.get("write")!;
+    await write({ path: "/mcp-site/index.html", content: "<!doctype html><p>hi</p>" }, {});
+
+    const result = await handlers.get("share-create")!({ path: "/mcp-site" }, {});
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.kind).toBe("site");
+    expect(body.sharePath).toMatch(/^\/site\/[^/]+\/$/);
+    expect(body.url).toBe(`http://127.0.0.1:7433${body.sharePath}`);
+    expect(body.maxViews).toBeNull();
   });
 });
 
@@ -414,29 +467,6 @@ describe("whoami hides inaccessible drives", () => {
       m.drives.map((d: any) => d.driveId)
     );
     expect(allDriveIds).not.toContain(h.foreignDriveId);
-  });
-});
-
-describe("Schema conversion", () => {
-  test("all op schemas are ZodObject instances", () => {
-    const ops = getRegisteredOps();
-    for (const op of ops) {
-      const def = getOpDefinition(op);
-      expect(def).toBeDefined();
-      // All our op schemas should be ZodObject
-      expect(def!.schema).toBeInstanceOf(z.ZodObject);
-    }
-  });
-
-  test("ZodObject schemas have extractable shape", () => {
-    const ops = getRegisteredOps();
-    for (const op of ops) {
-      const def = getOpDefinition(op);
-      if (def!.schema instanceof z.ZodObject) {
-        const shape = (def!.schema as z.ZodObject<any>).shape;
-        expect(typeof shape).toBe("object");
-      }
-    }
   });
 });
 

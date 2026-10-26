@@ -1,6 +1,11 @@
 import type { MiddlewareHandler } from "hono";
 import type { AppEnv } from "../types.js";
 
+/** The token is the credential for /share/:token and /site/:token, so it never reaches the logs. */
+function redactShareToken(path: string): string {
+  return path.replace(/^\/(share|site)\/[^/]+/, "/$1/<token>");
+}
+
 /**
  * Request logger with start AND completion lines.
  *
@@ -13,7 +18,7 @@ export function requestLogMiddleware(): MiddlewareHandler<AppEnv> {
   let seq = 0;
 
   return async (c, next) => {
-    const path = c.req.path;
+    const path = redactShareToken(c.req.path);
     if (path === "/health") return next();
 
     const id = ++seq;

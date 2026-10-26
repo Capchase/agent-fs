@@ -72,6 +72,18 @@ docker run -d -p 7433:7433 -v agent-fs-data:/data ghcr.io/desplega-ai/agent-fs:l
 
 Images are tagged with the full version (`0.2.0`), major.minor (`0.2`), major (`0`), git SHA, and `latest`. Browse available tags at [ghcr.io/desplega-ai/agent-fs](https://github.com/desplega-ai/agent-fs/pkgs/container/agent-fs).
 
+### Live UI image
+
+Each release also publishes `ghcr.io/desplega-ai/agent-fs-live` with the same tags: the `live/` app served by nginx on port 8080 as a non-root user, with `/healthz` for probes. It needs only `/tmp` writable:
+
+```bash
+docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges -p 8080:8080 ghcr.io/desplega-ai/agent-fs-live:<version>
+```
+
+Use the same `<version>` as your server image, and enter the server URL and API key in the UI. `VITE_*` values are compiled in, so runtime env vars do not configure it. The image is built with `VITE_ANONYMIZED_TELEMETRY=false`, so it sends no telemetry. To opt in, build it with `docker build -f Dockerfile.live --build-arg VITE_ANONYMIZED_TELEMETRY=true .`.
+
+To keep the UI and the API on one origin (no CORS), serve the API under a path prefix such as `/fs` on the UI host, strip the prefix before it reaches the server, and enter `https://<ui-host>/fs` as the endpoint. The API's own routes (`/orgs/...`) collide with the UI's routes, so they cannot share the root. Check an image locally with `bash scripts/smoke-live-image.sh <image>`.
+
 ## Fly.io Deployment
 
 ### Quick Start (Interactive Script)
@@ -142,7 +154,11 @@ curl -X POST https://your-app.fly.dev/auth/register \
 | `shared-cpu-2x` | 2 shared | 512 MB–1 GB | Small teams, moderate traffic |
 | `performance-1x` | 1 dedicated | 2 GB | Production, heavy embedding workloads |
 
-The default `fly.toml` uses `shared-cpu-1x` with 512 MB. Adjust in `fly.toml` under `[[vm]]` or pass the instance size when prompted by the deploy script.
+The repo's `fly.toml` temporarily uses `performance-8x` with 16 GB for the prod re-embed.
+A later PR sets `performance-1x` with 4 GB.
+On `shared-cpu-1x`, a large index exhausted the shared CPU budget and delayed searches and health checks.
+`flyctl deploy` applies the `[[vm]]` size on every deploy and overrides manual scaling.
+Adjust `[[vm]]` in `fly.toml` or select the instance size when the deploy script prompts you.
 
 ## Upgrading to 0.13.1: search index migration
 
@@ -154,6 +170,139 @@ Existing databases migrate themselves on the first start of 0.13.1:
 2. **In the background, after listening:** the old index rows are copied into the new layout in small committed batches. Progress is logged as `search index migration: ...`. A restart resumes where it left off. Search stays complete during the copy: both layouts are queried until the copy finishes. Expect a few multi-second stalls on large indexes (FTS5 merges and the final drop of the old table), then nothing.
 
 Nothing to do by hand. If you prefer the startup cost outside a traffic window, start the new version once off-peak. If search results ever look incomplete after an upgrade, `agent-fs reindex` rebuilds the index from storage.
+
+## Upgrading to 0.16.5: embeddings re-embedded
+
+0.16.5 stores every embedding at unit length, so `vec-search` scores are cosine similarity (1 is identical, about 0.3 is unrelated) instead of `1 / (1 + distance)`. The local model returns vectors with a norm near 23, so the old scores sat near 0.05 for every result.
+
+On the first start, the daemon marks every indexed file `pending` and embeds it again in the background, one file at a time, in the same embedding slots that new writes use. Progress is logged as `embedding migration: ...`, and a restart resumes. Search keeps working meanwhile. The same re-embed runs again whenever the embedding provider changes.
+
+The re-embed pauses after each file so it uses at most a quarter of the CPU time (`AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE`, default `0.25`). Requests run during the pauses. A `shared-cpu-1x` Fly machine gets a guaranteed 1/16 of a core and runs out of burst budget during a long re-embed. The API then answers in seconds and health checks fail. On such a machine, either set `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE=0.05` or scale up for the run (`fly scale vm performance-1x`), then scale back. Set `1` to run at full speed on a dedicated host.
+
+Text files larger than 2,000,000 characters are not embedded, on write or in the re-embed. Chunking them blocked the daemon for many minutes, and their batch was over the OpenAI request limits anyway. Their status is cleared, like a binary file.
+
+## Upgrading to 0.16.6: local embeddings re-embedded
+
+Only the `local` provider is affected. Before 0.16.6 it embedded in batches of 512 tokens, so a chunk longer than that got a wrong vector. That was 60% of the chunks in a sample corpus. 0.16.6 embeds each chunk in one batch.
+
+On the first start, the daemon re-embeds every file once more, in the background, the same way as in 0.16.5. If the 0.16.5 run has not finished yet, the two runs merge: files still `pending` are embedded once, with the fixed batch. `openai` and `gemini` keep their vectors, and nothing runs for them.
+
+## Upgrading to 0.17.4: image and PDF-page embeddings
+
+EmbeddingGemma 2 indexes PNG, JPEG, WebP, and GIF files with a paced background job.
+It also renders and embeds the first 3 pages of each PDF.
+OpenAI, Gemini, and nomic skip image work.
+PDF text remains searchable with every provider.
+
+The image job uses the text migration CPU share, `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE` (default `0.25`), at boot and after writes.
+The job runs after the text migration.
+Pauses count process CPU time across all cores.
+At the default share, measurements were about 26 seconds per image on an M2 Pro.
+A 2 GB arm64 container took about 33 seconds per image.
+Allow about one hour for 100 images.
+Inference itself takes about 1.6 seconds per image on an M2 Pro.
+A share of `1` runs without pauses.
+It uses an image token budget of 140.
+Measure CPU time and peak RSS on your host before you choose capacity.
+The image job loads a separate vision model and disposes it after 60 seconds without image calls.
+
+The Docker image includes `@napi-rs/canvas` for PDF rendering.
+For a global CLI install, also run `bun add -g @napi-rs/canvas@1.0.11`.
+Without canvas, image files remain searchable, but PDFs receive no page images.
+Search results report `kind: "image"` with `[image]` or `[PDF page N]` markers.
+Use `agent-fs signed-url <path> --inline` to view the matching file.
+
+## Upgrading to 0.17.3: PDF text is searchable
+
+PDF text is searchable with every embedding provider. At boot, the daemon indexes existing PDFs once in the paced background migration.
+With OpenAI or Gemini, this sends extracted PDF text to the provider.
+Without an embedding provider, run `agent-fs reindex` in each drive to populate full-text search.
+
+## Vector search cost
+
+`vec-search` and the semantic half of `search` compare the query with every stored chunk vector, in one scan per search. The cost grows with the total chunk count across all drives: on a dedicated CPU, 150k chunks take about 400 ms per scan.
+
+The scan runs on a worker thread with its own read-only connection, so a slow search never stalls other requests or `/health`. Right after start, the worker scans once to load the vectors into the OS page cache. On a large index that takes a while (about 25 s for 470 MB of vectors on a Fly volume), and searches sent meanwhile wait for it.
+
+0.16.7 had an opt-in `AGENT_FS_VECTOR_INDEX=int8` index. It was slower than the exact scan on a real disk, so 0.16.8 removes it and drops its table on start.
+
+## Upgrading to 0.18.0
+
+Fresh local indexes use EmbeddingGemma 2 when transformers 4.3.1 loads locally.
+Otherwise, they use `nomic-embed-text-v1.5`.
+Existing nomic indexes stay on nomic, including older indexes without a stored format.
+An explicit `EMBEDDING_MODEL` overrides this choice.
+OpenAI and Gemini selection stays the same.
+
+Fresh Docker volumes download 339 MB for text during warmup at the first boot, plus 195 MB when image indexing starts.
+Plan for 2 GB RAM, or set `EMBEDDING_MODEL=nomic-embed-text-v1.5`.
+The daemon boot log names the selected local model and its reason.
+`agent-fs config validate` shows the configured model and whether transformers loads locally.
+
+## Upgrading to 0.18.1: chunking and embedding size cap
+
+New writes use new chunk boundaries. Existing chunks stay unchanged.
+The chunker change does not trigger re-embedding.
+Chunking works offline and does not download a tokenizer.
+
+Set `AGENT_FS_EMBEDDING_MAX_BYTES` to limit text embeddings by UTF-8 bytes after base64 stripping.
+The cap accepts a positive integer. Unset or invalid values mean no cap.
+For PDFs, the cap measures extracted text, not the PDF file size.
+Text over the cap keeps its full-text search index.
+The indexer deletes its text chunks and vectors and reports `embeddingStatus: "skipped"`.
+Image and PDF-page embeddings stay unchanged.
+
+Restart the daemon after a cap change.
+At boot, a changed cap queues skipped files and indexed files larger than the new cap.
+This check uses original FTS bytes and can queue extra files that contain base64.
+The indexer then applies the new cap.
+`reindex` skips files with `skipped` status, as it skips files with `indexed` status.
+`stat`, CLI, MCP, and the live file metadata show `skipped`.
+
+## Upgrading to 0.18.2: embedding drive exclusions and base64 stripping
+
+New embeddings strip large base64 payloads except in PDF text. Existing chunks stay until the file changes.
+
+Set `AGENT_FS_EMBEDDING_EXCLUDE_DRIVES` to a comma-separated list of drive IDs, then restart the daemon.
+Unset or empty values exclude no drives.
+Excluded drives keep FTS. Their text files report `skipped`, and their image status stays NULL.
+At boot, the daemon queues newly excluded text files to delete their text vectors and immediately deletes their image chunks and vectors.
+When a drive leaves the list, the daemon queues its skipped text files and makes its images eligible again.
+The exclusion list, size cap and embedding format can change during the same boot.
+
+## Using EmbeddingGemma 2 (0.17.2)
+
+Set `EMBEDDING_PROVIDER=local` and `EMBEDDING_MODEL=embeddinggemma-2`.
+With an empty model setting, fresh indexes use EmbeddingGemma 2 when transformers 4.3.1 loads locally.
+Existing nomic indexes stay on nomic.
+
+- First use downloads 339 MB for text into `$AGENT_FS_HOME/models`. Image indexing downloads another 195 MB.
+- Text inference uses about 0.5 GB RSS at rest and about 1.1 GB at peak on the measured Mac.
+- A model switch re-embeds every indexed file and retries every failed file. `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE` controls the pace. Search quality drops until the migration finishes.
+- For global installs on macOS and Linux (arm64 and amd64), run `bun add -g @desplega.ai/agent-fs`, then `bun add -g @huggingface/transformers@4.3.1`. For PDF page images, also run `bun add -g @napi-rs/canvas@1.0.11`. The Docker image includes all of them.
+- `npm i -g` installs are not tested with EmbeddingGemma 2.
+- After the first download, the model loads from `$AGENT_FS_HOME/models` without network access.
+- Intel Macs lack an `onnxruntime-node` darwin x64 binary. Alpine/musl is also unsupported.
+
+## Upgrading to 0.17.1: failed embeddings retried once
+
+Until 0.17.1 nothing retried a file whose embedding failed. Three causes are fixed:
+- Blank text sent an empty request, which providers reject. Blank files are now skipped, like binary files.
+- OpenAI got a large file in one request, over its limits of 2,048 inputs and 300,000 tokens. The OpenAI provider now splits a file into several requests.
+- A transient error (rate limit, network) left the file failed for good.
+
+Chunking a large file used to block the server for seconds (a 1.4 MB CSV took over 9 s on a laptop), which can fail health checks. Text over 64 KB is now chunked in segments, with a yield to the event loop between them.
+
+On the first start of 0.17.1, every `failed` file is marked `pending` and the background job embeds it again, with the same CPU pacing as a re-embed. This happens once (and again after a provider change). The log names each file that still fails, with the provider error.
+
+## Upgrading to 0.17.0: explicit EMBEDDING_PROVIDER wins
+
+An explicit, non-empty `EMBEDDING_PROVIDER` now takes priority over `OPENAI_API_KEY` and `GEMINI_API_KEY`.
+The selected cloud provider uses `embedding.apiKey` first, then its own API key environment variable.
+`EMBEDDING_API_KEY` supplies `embedding.apiKey`.
+When `EMBEDDING_PROVIDER` names another provider than config.json, agent-fs does not use the model and API key from config.json. `EMBEDDING_MODEL` and `EMBEDDING_API_KEY` still apply.
+Production configurations with `EMBEDDING_PROVIDER=openai` and `EMBEDDING_API_KEY` keep the same behavior and vectors.
+Without an explicit provider, selection still tries `OPENAI_API_KEY`, `GEMINI_API_KEY`, then the configuration.
 
 ## Environment Variables Reference
 
@@ -172,11 +321,21 @@ All environment variables supported by the server. Priority: env vars > config.j
 | `S3_PUBLIC_ENDPOINT` | `s3.publicEndpoint` | _(falls back to `S3_ENDPOINT`)_ | Externally-reachable S3 endpoint used only when generating presigned URLs. Falls back to `S3_ENDPOINT`. |
 | `SERVER_PORT` | `server.port` | `7433` | |
 | `SERVER_HOST` | `server.host` | `127.0.0.1` | Set to `0.0.0.0` in containers |
-| `EMBEDDING_PROVIDER` | `embedding.provider` | `local` | `local`, `openai`, or `gemini` |
-| `EMBEDDING_MODEL` | `embedding.model` | — | Model name for the chosen provider |
-| `EMBEDDING_API_KEY` | `embedding.apiKey` | — | API key for `openai` or `gemini` providers |
+| `EMBEDDING_PROVIDER` | `embedding.provider` | `local` | `local`, `openai`, `gemini`, or `openrouter`. A non-empty value takes priority over API key variables. |
+| `EMBEDDING_MODEL` | `embedding.model` | (empty) | Selects the local model or OpenRouter model (default `openai/text-embedding-3-small`, must return 768 dimensions). OpenAI and Gemini ignore it. |
+| `EMBEDDING_API_KEY` | `embedding.apiKey` | _(unset)_ | API key for `openai`, `gemini`, or `openrouter`. An explicit provider uses this key before its own API key variable. |
+| `OPENROUTER_API_KEY` | _(env only)_ | _(unset)_ | Supplies the key when OpenRouter is selected through `EMBEDDING_PROVIDER` or config and `embedding.apiKey` is empty. Does not select a provider on its own. |
+| `OPENAI_API_KEY` | _(env only)_ | _(unset)_ | Selects OpenAI when `EMBEDDING_PROVIDER` is absent. Supplies the key for explicit OpenAI when `embedding.apiKey` is empty. |
+| `GEMINI_API_KEY` | _(env only)_ | _(unset)_ | Selects Gemini when the explicit provider and `OPENAI_API_KEY` are absent. Supplies the key for explicit Gemini when `embedding.apiKey` is empty. |
 | `ANONYMIZED_TELEMETRY` | _(env only)_ | `true` | Set to `false` to stop anonymous usage events. See [docs/telemetry.md](./docs/telemetry.md). |
 | `DO_NOT_TRACK` | _(env only)_ | _(unset)_ | Any value except empty, `0`, `false`, `no`, or `off` also stops telemetry. |
+| `AGENT_FS_PUBLIC_URL` | `server.publicUrl` | _(derived from the request)_ | Public address of this API server (e.g. `https://agent-fs-acme.fly.dev`), used to build absolute `/share/<token>` links. Set it when a proxy does not forward `Host` / `X-Forwarded-Proto`. |
+| `AGENT_FS_SHARE_RATE_LIMIT` | `server.shareRateLimit.requestsPerMinute` | `120` | Per-IP requests per minute for the public `/share/*` routes; `0` disables. Behind a reverse proxy other than Fly, all traffic shares the proxy's address, so raise it. |
+| `AGENT_FS_PRESENCE_RATE_LIMIT` | `server.presenceRateLimit.requestsPerMinute` | `1200` | Per-API-key requests per minute for the live UI presence routes (`/orgs/*/drives/*/presence`). They skip the general limit, so cursor updates cannot use up the normal API budget. `0` disables. |
+| `AGENT_FS_SITE_RATE_LIMIT` | `server.siteRateLimit.requestsPerMinute` | `600` | Per-IP requests per minute for the public `/site/*` routes (folder shares); `0` disables. One page load fetches many files, so it is higher than the share limit. |
+| `AGENT_FS_EMBEDDING_MAX_BYTES` | _(env only)_ | No cap | Positive integer limit for text embeddings, in UTF-8 bytes after base64 stripping (except PDF text). Unset or invalid means no cap. Text over the cap keeps full-text search and reports `skipped`. Restart after changes. |
+| `AGENT_FS_EMBEDDING_EXCLUDE_DRIVES` | _(env only)_ | No exclusion | Comma-separated drive IDs. The parser trims IDs and ignores empty entries. Excluded drives keep FTS and lose text and image vectors. Text reports `skipped`. Restart after changes. |
+| `AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE` | _(env only)_ | `0.25` | Share of CPU time the text migration and image job may use, above 0 and at most 1. Text pauses after each file. Images pause after each part. `1` runs without pauses. Invalid values use the default. See [Upgrading to 0.16.5](#upgrading-to-0165-embeddings-re-embedded). |
 | `AGENT_FS_CLOUD` | _(env only)_ | _(unset)_ | Set to `true` only on servers the agent-fs team hosts. Marks telemetry events with `is_cloud`. |
 
 When both `AWS_*` and `S3_*` variants are set, the `AWS_*` variant takes precedence (Tigris injects `AWS_*` automatically).

@@ -46,9 +46,11 @@ function currentTheme(): "default" | "dark" {
 
 interface MermaidDiagramProps {
   code: string
+  "data-line-start"?: number
+  "data-line-end"?: number
 }
 
-export function MermaidDiagram({ code }: MermaidDiagramProps) {
+export function MermaidDiagram({ code, "data-line-start": lineStart, "data-line-end": lineEnd }: MermaidDiagramProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const reactId = useId()
   const diagramId = `mermaid-${reactId.replace(/:/g, "")}`
@@ -91,13 +93,19 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
   // we reused the inline SVG verbatim the two copies would share an id and
   // CSS would collapse onto the first one in the DOM, leaving the lightbox
   // copy unstyled (or, depending on size, invisible).
+  // Each render also gets a fresh id: mermaid.render removes any element that
+  // already has the requested id, and on reopen that is the previous lightbox
+  // SVG still on screen. Rendering the same string again would leave React
+  // nothing to update, so the modal stayed empty.
+  const lightboxRenderCount = useRef(0)
   useEffect(() => {
     if (!open) return
     let cancelled = false
+    const renderId = `${diagramId}-lightbox-${++lightboxRenderCount.current}`
     loadMermaid()
       .then(async (mermaid) => {
         mermaid.initialize({ startOnLoad: false, theme, securityLevel: "strict" })
-        const result = await mermaid.render(`${diagramId}-lightbox`, code)
+        const result = await mermaid.render(renderId, code)
         if (cancelled) return
         setLightboxSvg(result.svg)
       })
@@ -118,7 +126,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
 
   if (error) {
     return (
-      <div className="my-4 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
+      <div data-line-start={lineStart} data-line-end={lineEnd} className="my-4 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
         <div className="font-medium text-destructive">Mermaid render error</div>
         <pre className="mt-1 whitespace-pre-wrap text-muted-foreground">{error}</pre>
         <pre className="mt-2 whitespace-pre-wrap text-muted-foreground">{code}</pre>
@@ -128,7 +136,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
 
   return (
     <>
-      <div className="group relative my-4">
+      <div data-line-start={lineStart} data-line-end={lineEnd} className="group relative my-4">
         <div
           ref={containerRef}
           className="flex justify-center overflow-auto rounded-md border border-border bg-card p-4"

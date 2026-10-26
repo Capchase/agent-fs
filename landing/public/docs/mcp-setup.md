@@ -27,7 +27,7 @@ Add to your `.mcp.json` (project-level or `~/.claude/.mcp.json` for global):
 
 To enable semantic search, configure an embedding provider on the daemon (via `~/.agent-fs/config.json` or environment variables). The daemon initializes embeddings at startup and makes them available to both REST and MCP clients.
 
-Supported providers: `OPENAI_API_KEY` (OpenAI), `GEMINI_API_KEY` (Google Gemini), or local llama.cpp (configured in `~/.agent-fs/config.json`).
+Supported providers: `OPENAI_API_KEY` (OpenAI), `GEMINI_API_KEY` (Google Gemini), or local (configured in `~/.agent-fs/config.json`). Local runs nomic-embed-text-v1.5 on llama.cpp or EmbeddingGemma 2 on transformers.js. Set `EMBEDDING_PROVIDER` to pick one explicitly. It takes priority over the API key variables.
 
 ## Cursor
 
@@ -113,11 +113,22 @@ The server advertises tools via the standard MCP `tools/list` method.
 | Tool | Description |
 |------|-------------|
 | `comment-add` | Add a comment to a file. Supports line ranges and threading. |
-| `comment-list` | List comments on a file with inline replies. Filter by path, resolved state, or parent. |
+| `comment-list` | List comments on a file with inline replies. Filter by path, `pathPrefix`, resolved state, or parent. |
 | `comment-get` | Get a single comment by ID with all replies. |
 | `comment-update` | Update a comment's body (author only). |
 | `comment-delete` | Soft-delete a comment (author only). |
 | `comment-resolve` | Resolve or reopen a root comment. |
+| `drive-members` | List the active drive's member emails and display names. |
+
+### Favorites
+
+Favorites are per user: the tools act on the authenticated user's own stars in the active drive.
+
+| Tool | Description |
+|------|-------------|
+| `favorite-add` | Star a file or folder. |
+| `favorite-remove` | Remove your star from a file or folder. |
+| `favorite-list` | List your favorites in the active drive. |
 
 ### Identity & Member Management
 
@@ -145,7 +156,7 @@ agent-fs has three search tools for different use cases:
 
 **`fts`** is keyword-based full-text search. Use when you know relevant terms but not the exact phrasing. Supports FTS5 query syntax (AND, OR, NOT, phrases).
 
-**`search`** is semantic/vector search. Use when you want to find files by meaning, not keywords. Requires an embedding provider (OpenAI, Gemini, or local llama.cpp). Best for questions like "files related to user authentication" where keyword matching would miss relevant results.
+**`search`** is semantic/vector search. Use when you want to find files by meaning, not keywords. Requires an embedding provider (OpenAI, Gemini, or local). Local runs nomic-embed-text-v1.5 on llama.cpp or EmbeddingGemma 2 on transformers.js. Best for questions like "files related to user authentication" where keyword matching would miss relevant results.
 
 ## Environment Variables
 

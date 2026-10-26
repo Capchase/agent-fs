@@ -3,10 +3,19 @@ import {
   getConfig,
   DEFAULT_MAX_UPLOAD_BYTES,
   getHome,
+  getDbPath,
   createStorageAdapter,
   createEmbeddingProviderFromEnv,
+  storedFormat,
+  hasChunks,
   prepareFtsMigration,
   runFtsMigration,
+  runEmbeddingMigration,
+  prepareImageEmbeddings,
+  canRenderPdfPages,
+  scheduleImageEmbeddings,
+  migrationCpuShare,
+  startVectorSearchWorker,
   startServerTelemetry,
 } from "@/core";
 import type { Database } from "bun:sqlite";
@@ -14,12 +23,18 @@ import type { EmbeddingProvider } from "@/core";
 import { join } from "node:path";
 import { createApp } from "./app.js";
 import { startIpcServer } from "./ipc/server.js";
+import { runEmbeddingStatusMigration } from "@/core/db/embedding-status-migration.js";
+import { runPathNormalizationAtStartup } from "./startup-migrations.js";
 
 const config = getConfig();
 
 // Initialize database
 const db = createDatabase();
 const sqlite = (db as any).$client as Database;
+runPathNormalizationAtStartup(sqlite);
+// Extend the legacy text status constraint before any indexer starts.
+// Fresh databases already admit skipped in CREATE_TABLES_SQL.
+runEmbeddingStatusMigration(sqlite);
 
 // Databases from before 0.13.1 carry the old full-text index layout. Swap the
 // name over now (instant DDL) so every write from here on lands in the new
@@ -50,10 +65,35 @@ try {
 // Initialize embedding provider (graceful failure — semantic search unavailable if this fails)
 let embeddingProvider: EmbeddingProvider | null = null;
 try {
-  embeddingProvider = await createEmbeddingProviderFromEnv(config.embedding);
+  embeddingProvider = await createEmbeddingProviderFromEnv(config.embedding, {
+    storedFormat: storedFormat(sqlite),
+    hasChunks: hasChunks(sqlite),
+    log: (message) => console.log(message),
+  });
 } catch (err) {
   console.warn("Embedding provider unavailable, semantic search disabled:", err);
 }
+
+await canRenderPdfPages(embeddingProvider);
+let imageEmbeddingsPending = false;
+
+// Re-embed files whose vectors predate the current provider or vector format,
+// plus any file whose on-write embedding never ran. Background, resumable.
+// Reserve the shared slot before requests can schedule image work.
+const provider = embeddingProvider;
+const embeddingMigration = provider
+  ? runEmbeddingMigration(db, s3, provider, {
+    log: (msg) => console.log(msg),
+    cpuShare: migrationCpuShare(process.env.AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE),
+    afterMigration: async () => {
+      try {
+        imageEmbeddingsPending = await prepareImageEmbeddings(sqlite, provider);
+      } catch (err) {
+        console.error("image embedding preparation failed (will retry on next start):", err);
+      }
+    },
+  })
+  : null;
 
 // Create app
 const app = createApp(db, s3, embeddingProvider);
@@ -72,6 +112,30 @@ if (ftsMigrationPending) {
   runFtsMigration(sqlite, { log: (msg) => console.log(msg) }).catch((err) => {
     console.error("search index migration failed (will resume on next start):", err);
   });
+}
+
+// Vector KNN scans every stored vector and can take seconds (the first scan
+// after a restart reads the whole table from disk). Running it on a worker
+// thread keeps /health and every other request answering meanwhile.
+startVectorSearchWorker(sqlite, getDbPath());
+
+if (provider && embeddingMigration) {
+  embeddingMigration
+    .then((r) => {
+      if (!r) return;
+      console.log(`embedding migration done: ${r.indexed} embedded, ${r.failed} failed, ${r.skipped} skipped, ${r.superseded} superseded`);
+    })
+    .catch((err) => {
+      console.error("embedding migration failed (will resume on next start):", err);
+    })
+    .finally(() => {
+      if (imageEmbeddingsPending) {
+        void scheduleImageEmbeddings(db, s3, provider, {
+          log: (msg) => console.log(msg),
+          cpuShare: migrationCpuShare(process.env.AGENT_FS_EMBEDDING_MIGRATION_CPU_SHARE),
+        });
+      }
+    });
 }
 
 // Anonymized telemetry: `server.started` now, `server.heartbeat` every 24h

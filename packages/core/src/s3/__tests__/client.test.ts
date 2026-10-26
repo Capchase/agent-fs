@@ -47,6 +47,24 @@ describe("S3 Client", () => {
     expect(client.versioningEnabled).toBe(false);
   });
 
+  test("sets bounded connection and idle socket timeouts", async () => {
+    const client = createClient() as unknown as {
+      client: {
+        config: {
+          requestHandler: { configProvider: Promise<unknown> };
+          maxAttempts: () => Promise<number>;
+        };
+      };
+    };
+
+    await expect(client.client.config.requestHandler.configProvider).resolves.toMatchObject({
+      connectionTimeout: 5_000,
+      socketTimeout: 30_000,
+      requestTimeout: undefined,
+    });
+    await expect(client.client.config.maxAttempts()).resolves.toBe(3);
+  });
+
   test("initializes with versioningEnabled from config", () => {
     const client = new AgentS3Client({
       provider: "minio",
@@ -110,6 +128,15 @@ describe("S3 Client", () => {
     const url = await client.getPresignedUrl("some/key.txt", 3600);
     const parsed = new URL(url);
     expect(parsed.host).toBe("localhost:9000");
+  });
+
+  test("getPresignedUrl signs at the given signingDate, not at the moment it runs", async () => {
+    const client = createClient();
+    const signingDate = new Date(Date.now() - 5000);
+    const parsed = new URL(await client.getPresignedUrl("some/key.txt", 30, undefined, undefined, signingDate));
+    const stamp = signingDate.toISOString().replace(/[-:]|\.\d{3}/g, "");
+    expect(parsed.searchParams.get("X-Amz-Date")).toBe(stamp);
+    expect(parsed.searchParams.get("X-Amz-Expires")).toBe("30");
   });
 
   test("lists every page and preserves the request fields", async () => {

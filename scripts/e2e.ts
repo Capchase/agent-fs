@@ -9,10 +9,11 @@
  *   bun run scripts/e2e.ts "agent-fs"
  */
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync, readFileSync, mkdtempSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, mkdtempSync, readdirSync, symlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
+import { Database } from "bun:sqlite";
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -23,11 +24,22 @@ import { createServer } from "node:net";
 process.env.ANONYMIZED_TELEMETRY = "false";
 
 const rawArgs = process.argv.slice(2);
-const positional = rawArgs.filter((a) => !a.startsWith("--"));
+const localModelIndex = rawArgs.indexOf("--local-model");
+const modelsDirIndex = rawArgs.indexOf("--models-dir");
+const localModel = localModelIndex < 0 ? undefined : rawArgs[localModelIndex + 1];
+const modelsDir = modelsDirIndex < 0 ? undefined : rawArgs[modelsDirIndex + 1];
+if ((localModelIndex >= 0 && (!localModel || localModel.startsWith("--"))) ||
+    (modelsDirIndex >= 0 && (!modelsDir || modelsDir.startsWith("--"))) ||
+    (!!localModel !== !!modelsDir)) {
+  console.error("Supply both --local-model <id> and --models-dir <dir>.");
+  process.exit(1);
+}
+const positional = rawArgs.filter((a, i) => !a.startsWith("--") &&
+  !(localModelIndex >= 0 && i === localModelIndex + 1) && !(modelsDirIndex >= 0 && i === modelsDirIndex + 1));
 const flags = new Set(rawArgs.filter((a) => a.startsWith("--")));
 const cmd = positional[0];
 if (!cmd) {
-  console.error("Usage: bun run scripts/e2e.ts <cli-command> [--fuse-only] [--local-only]");
+  console.error("Usage: bun run scripts/e2e.ts <cli-command> [--fuse-only] [--local-only] [--local-model <id> --models-dir <dir>]");
   console.error('  e.g. bun run scripts/e2e.ts "bun run packages/cli/src/index.ts --"');
   process.exit(1);
 }
@@ -94,12 +106,10 @@ const testEnv = (): NodeJS.ProcessEnv => {
   const base = {
     ...process.env,
     AGENT_FS_HOME: testDir,
-    // Force the credential-free/no-embedding path. The local provider lazily
-    // downloads a ~329MB model on first reindex, which is not part of these
-    // CLI/API/MCP tests; vec/hybrid search already assert graceful degradation.
-    EMBEDDING_PROVIDER: "openai",
+    // Enable local embeddings only when a model is explicitly selected.
+    EMBEDDING_PROVIDER: localModel ? "local" : "openai",
     EMBEDDING_API_KEY: "",
-    EMBEDDING_MODEL: "",
+    EMBEDDING_MODEL: localModel ?? "",
     OPENAI_API_KEY: "",
     GEMINI_API_KEY: "",
     // Clear AWS_* vars (they take precedence over S3_* in applyEnvOverrides).
@@ -266,9 +276,9 @@ function localEnv(
     AGENT_FS_STORAGE_PROVIDER: "local",
     AGENT_FS_LOCAL_ROOT: storageRoot,
     AGENT_FS_APP_URL: appUrl,
-    EMBEDDING_PROVIDER: "openai",
+    EMBEDDING_PROVIDER: localModel ? "local" : "openai",
     EMBEDDING_API_KEY: "",
-    EMBEDDING_MODEL: "",
+    EMBEDDING_MODEL: localModel ?? "",
     OPENAI_API_KEY: "",
     GEMINI_API_KEY: "",
     S3_ENDPOINT: "",
@@ -307,6 +317,7 @@ async function setupLocalBackend(opts: {
   const home = join(tmpdir(), `${containerName}-${opts.label}`);
   const storageRoot = join(home, "storage");
   mkdirSync(storageRoot, { recursive: true });
+  if (modelsDir) symlinkSync(resolve(modelsDir), join(home, "models"));
 
   const port = await findFreePort();
   const appUrl = `http://127.0.0.1:${port}`;
@@ -530,6 +541,7 @@ const mcpHeaders = (key: string) => ({
 async function setup() {
   // Create temp AGENT_FS_HOME
   mkdirSync(testDir, { recursive: true });
+  if (modelsDir) symlinkSync(resolve(modelsDir), join(testDir, "models"));
 
   if (localOnly) {
     mkdirSync(primaryStorageRoot, { recursive: true });
@@ -976,6 +988,9 @@ async function runTests() {
     // Capability gating (no-versioning) + signed-url presigned/app fallback.
     await unsupportedOpSuite();
     await signedUrlMatrix(minioBackend, localBackend);
+
+    // Two tenants on one local storage root: `..` must not cross drives.
+    await localContainmentSuite(localBackend);
   }
   await runFuseTests();
 }
@@ -995,11 +1010,120 @@ async function runStandardTests(daemonUrl: string) {
 
   // -- write + cat roundtrip --
 
+  await test("drive stream receives a file change from the CLI", async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(`${daemonUrl}/orgs/${personalOrgId}/drives/${personalDriveId}/events`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      });
+      assert(response.status, 200);
+      reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const nextFrame = async () => {
+        while (!buffer.includes("\n\n")) {
+          const { done, value } = await reader!.read();
+          if (done) throw new Error("Event stream closed before the expected event");
+          buffer += decoder.decode(value, { stream: true });
+        }
+        const end = buffer.indexOf("\n\n");
+        const frame = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        return frame;
+      };
+      assertIncludes(await nextFrame(), "event: ready");
+      runJson('write /stream-e2e.md --content "change stream"');
+      const frame = await nextFrame();
+      assertIncludes(frame, "event: file.changed");
+      const event = JSON.parse(frame.split("\n").find((line) => line.startsWith("data: "))!.slice(6));
+      assert(event.path, "/stream-e2e.md");
+      assert(event.version, 1);
+      assert(event.operation, "write");
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+      await reader?.cancel().catch(() => {});
+    }
+  });
+
+  await test("presence stream, snapshot and delete", async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const base = `${daemonUrl}/orgs/${personalOrgId}/drives/${personalDriveId}`;
+    const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+    const sessionA = crypto.randomUUID();
+    const sessionB = crypto.randomUUID();
+    try {
+      const response = await fetch(`${base}/events?presence=1&sessionId=${sessionA}`, {
+        headers, signal: controller.signal,
+      });
+      assert(response.status, 200);
+      reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const nextFrame = async (): Promise<string> => {
+        while (true) {
+          const end = buffer.indexOf("\n\n");
+          if (end >= 0) {
+            const frame = buffer.slice(0, end);
+            buffer = buffer.slice(end + 2);
+            if (frame.startsWith(": ping")) continue;
+            return frame;
+          }
+          const { done, value } = await reader!.read();
+          if (done) throw new Error("Presence stream closed before the expected event");
+          buffer += decoder.decode(value, { stream: true });
+        }
+      };
+      assertIncludes(await nextFrame(), "event: ready");
+      assertIncludes(await nextFrame(), "event: presence.snapshot");
+      const put = await fetch(`${base}/presence/${sessionB}`, {
+        method: "PUT", headers, body: JSON.stringify({ path: null, mode: "view" }),
+      });
+      assert(put.status, 200);
+      const updated = await nextFrame();
+      assertIncludes(updated, "event: presence.updated");
+      assertIncludes(updated, sessionB);
+      const snapshot = await fetch(`${base}/presence`, { headers });
+      assert(snapshot.status, 200);
+      const data = await snapshot.json() as { sessions: Array<{ sessionId: string }> };
+      assert(data.sessions.some((session) => session.sessionId === sessionB), true);
+      const removed = await fetch(`${base}/presence/${sessionB}`, { method: "DELETE", headers });
+      assert(removed.status, 200);
+      const left = await nextFrame();
+      assertIncludes(left, "event: presence.left");
+      assertIncludes(left, sessionB);
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+      await reader?.cancel().catch(() => {});
+      await fetch(`${base}/presence/${sessionB}`, { method: "DELETE", headers }).catch(() => {});
+    }
+  });
+
   await test("write + cat roundtrip", () => {
     const result = runJson('write /hello.txt --content "Hello, agent-fs!"');
     assert(result.version, 1);
     const cat = runJson("cat /hello.txt");
     assert(cat.content, "Hello, agent-fs!");
+  });
+
+  await test("bare write shares metadata with slash-form stat and log", () => {
+    const written = runJson('write bare-path-e2e.md --content "canonical metadata"');
+    assert(written.path, "/bare-path-e2e.md");
+
+    const fileStat = runJson("stat /bare-path-e2e.md");
+    assert(fileStat.path, "/bare-path-e2e.md");
+    assert(fileStat.currentVersion, 1);
+    assert(fileStat.author === "unknown", false, "Expected the stored author");
+
+    const history = runJson("log /bare-path-e2e.md");
+    assert(history.versions.length, 1);
+    assert(history.versions[0].version, 1);
   });
 
   await test("download returns exact bytes for a deeply nested path", () => {
@@ -1198,6 +1322,7 @@ async function runStandardTests(daemonUrl: string) {
     assert(result.path, "/hello.txt");
     assert(typeof result.size, "number");
     assert(result.currentVersion >= 3, true, `Expected version >= 3, got ${result.currentVersion}`);
+    assert(typeof result.etag, "string", "stat should expose the storage etag");
   });
 
   // -- tail --
@@ -1254,6 +1379,47 @@ async function runStandardTests(daemonUrl: string) {
     const result = runJson("glob '*.txt'");
     const paths = result.matches.map((m: any) => m.path);
     assert(paths.includes("/hello.txt"), true, `Expected /hello.txt in glob, got ${JSON.stringify(paths)}`);
+  });
+
+  // -- find --
+
+  await test("find (fuzzy, case- and accent-insensitive file names)", () => {
+    const deck = "/find-e2e/decks/Zephyr Pitch Déck.md";
+    runJson(`write "${deck}" --content "deck"`);
+    runJson(`write "/find-e2e/zephyr/notes.md" --content "notes"`);
+
+    const byName = runJson("find zephyr");
+    assert(byName.matches[0]?.path, deck, `name hit must rank first, got ${JSON.stringify(byName.matches)}`);
+    assert(byName.total >= 2, true, "folder hit must also match");
+    assert(typeof byName.matches[0].score, "number");
+
+    for (const query of ["'deck ZEPHYR'", "zphr", "zephyr_deck"]) {
+      const paths = runJson(`find ${query}`).matches.map((m: any) => m.path);
+      assert(paths.includes(deck), true, `find ${query} missed ${deck}: ${JSON.stringify(paths)}`);
+    }
+
+    const scoped = runJson("find notes --path /find-e2e/zephyr --limit 1");
+    assert(scoped.matches.length, 1);
+    assert(scoped.matches[0].path, "/find-e2e/zephyr/notes.md");
+
+    assert(run("find zzqxj").trim(), "(no matches)");
+  });
+
+  await test("find via MCP tools/call", async () => {
+    const callRes = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "find", arguments: { query: "pitch deck zephyr" } },
+      }),
+    });
+    assert(callRes.ok, true, `MCP tools/call failed: ${callRes.status}`);
+    const body = await callRes.json() as any;
+    const parsed = JSON.parse(body.result?.content?.[0]?.text ?? "{}");
+    assert(parsed.matches?.[0]?.path, "/find-e2e/decks/Zephyr Pitch Déck.md", `got ${JSON.stringify(body)}`);
   });
 
   if (localOnly) {
@@ -1363,6 +1529,66 @@ async function runStandardTests(daemonUrl: string) {
     assert(Array.isArray(result.results), true, "Expected results array from vec-search");
   });
 
+  if (localModel) {
+    await test("local model ranks a paraphrased query", async () => {
+      run('write /local-model/cats.md --content "Cats are playful household pets. Kittens purr, chase toys, and sleep on soft cushions."');
+      run('write /local-model/cars.md --content "Automobile engines require oil changes. Vehicle brakes, tires, and transmissions need regular maintenance."');
+      const deadline = Date.now() + 120_000;
+      let results: { path: string }[] = [];
+      while (Date.now() < deadline) {
+        try {
+          results = runJson("vec-search 'a small furry companion that meows' --limit 100").results;
+          if (["/local-model/cats.md", "/local-model/cars.md"].every((path) => results.some((r) => r.path === path))) break;
+        } catch {}
+        await Bun.sleep(1000);
+      }
+      assert(results.some((r) => r.path === "/local-model/cars.md"), true, "Both local model fixtures must be indexed within 120 seconds");
+      assert(results[0]?.path, "/local-model/cats.md", "The paraphrased query must rank the cat document first");
+    });
+  } else {
+    skipTest("local model ranks a paraphrased query", "requires --local-model and --models-dir");
+  }
+
+  if (localModel === "embeddinggemma-2") {
+    await test("local model indexes image files and PDF page images", async () => {
+      const { createCanvas } = await import("@napi-rs/canvas");
+      const canvas = createCanvas(512, 512);
+      const context = canvas.getContext("2d");
+      context.fillStyle = "white";
+      context.fillRect(0, 0, 512, 512);
+      context.fillStyle = "red";
+      context.beginPath();
+      context.arc(256, 256, 180, 0, Math.PI * 2);
+      context.fill();
+      const png = join(testDir, "red-circle.png");
+      writeFileSync(png, await canvas.encode("png"));
+      const pdf = resolve("packages/core/src/search/__tests__/fixtures/image-only.pdf");
+      runJson(`write /local-model/red-circle.png --file '${png}'`);
+      runJson(`write /local-model/solar-kite.pdf --file '${pdf}'`);
+
+      for (const [query, path, page] of [
+        ["a red circle", "/local-model/red-circle.png", undefined],
+        ["SOLAR KITE", "/local-model/solar-kite.pdf", 1],
+      ] as const) {
+        const deadline = Date.now() + 300_000;
+        let match: { path: string; kind?: string; page?: number; snippet?: string } | undefined;
+        while (Date.now() < deadline) {
+          try {
+            const results = runJson(`vec-search '${query}' --limit 100`).results;
+            match = results.find((result: { path: string }) => result.path === path);
+            if (match?.kind === "image") break;
+          } catch {}
+          await Bun.sleep(1000);
+        }
+        assert(match?.kind, "image", `Expected an image match for ${path} within 300 seconds`);
+        assert(match?.page, page, `Expected the page locator for ${path}`);
+        assert(match?.snippet, page ? `[PDF page ${page}]` : "[image]", `Expected the image marker for ${path}`);
+      }
+    });
+  } else {
+    skipTest("local model indexes image files and PDF page images", "requires --local-model embeddinggemma-2 and --models-dir");
+  }
+
   // -- search (hybrid) --
 
   await test("search (hybrid)", () => {
@@ -1370,6 +1596,16 @@ async function runStandardTests(daemonUrl: string) {
     assert(Array.isArray(result.results), true, "Expected results array from hybrid search");
     // With FTS available, should find matches even without embedding provider
     assert(result.results.length > 0, true, "Expected hybrid search results via FTS fallback");
+  });
+
+  await test("PDF text is searchable without embedding credentials", () => {
+    const fixture = resolve("packages/core/src/search/__tests__/fixtures/text.pdf");
+    const path = "/search/maintenance.pdf";
+    runJson(`write ${path} --file '${fixture}'`);
+    const fts = runJson("fts 'basalt lighthouse maintenance log'");
+    assert(fts.matches.some((match: any) => match.path === path), true, "Expected PDF text in FTS results");
+    const search = runJson("search 'basalt lighthouse maintenance log'");
+    assert(search.results.some((result: any) => result.path === path), true, "Expected PDF text in hybrid search results");
   });
 
   // -- comments --
@@ -1383,6 +1619,35 @@ async function runStandardTests(daemonUrl: string) {
 
     const resolve = JSON.parse(run(`comment resolve ${add.id}`));
     assert(resolve.resolved, true, "Expected comment to be resolved");
+  });
+
+  await test("comment add --quote stores a text-quote anchor", () => {
+    const add = JSON.parse(run('comment add /hello.txt --body "Anchored" --quote "hello" --quote-suffix " world"'));
+    assert(add.quote?.exact, "hello");
+    assert(add.quote?.suffix, " world");
+
+    const list = JSON.parse(run("comment list /hello.txt"));
+    const found = list.comments.find((c: any) => c.id === add.id);
+    assert(found?.quote?.exact, "hello", "Expected the quote anchor in comment list");
+    assert(typeof found?.fileVersion, "number", "Expected the anchor version number in comment list");
+  });
+
+  await test("comment list --prefix includes nested paths and excludes sibling prefixes", () => {
+    for (const path of [
+      "prefix-e2e/docs/a.md",
+      "prefix-e2e/docs/sub/b.md",
+      "prefix-e2e/docs-old/c.md",
+    ]) {
+      runJson(`write ${path} --content "prefix fixture"`);
+      JSON.parse(run(`comment add ${path} --body "comment on ${path}"`));
+    }
+
+    const result = JSON.parse(run("comment list --prefix prefix-e2e/docs"));
+    const paths = result.comments.map((comment: any) => comment.path).sort();
+    assert(
+      JSON.stringify(paths),
+      JSON.stringify(["/prefix-e2e/docs/a.md", "/prefix-e2e/docs/sub/b.md"]),
+    );
   });
 
   // -- recent --
@@ -1573,6 +1838,89 @@ async function runStandardTests(daemonUrl: string) {
     assert(parsed.kind, localOnly ? "app" : "presigned");
   });
 
+  // -- reveal --
+
+  await test("reveal via API returns every ancestor listing plus stat", async () => {
+    runJson('write /reveal/a/b/deep.md --content "deep"');
+    runJson('write /reveal/a/sibling.md --content "sibling"');
+    const res = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ op: "reveal", path: "reveal/a/b/deep.md" }),
+    });
+    assert(res.ok, true, `Expected 200, got ${res.status}`);
+    const body = await res.json() as any;
+    assert(body.path, "/reveal/a/b/deep.md");
+    assert(body.stat.size, 4);
+    assert(
+      JSON.stringify(body.listings.map((l: any) => l.path)),
+      JSON.stringify(["/", "/reveal", "/reveal/a", "/reveal/a/b"]),
+    );
+    // Each listing must match what `ls` returns for that directory.
+    for (const listing of body.listings) {
+      const ls = runJson(`ls ${listing.path}`);
+      assert(JSON.stringify(listing.entries), JSON.stringify(ls.entries), `listing ${listing.path} differs from ls`);
+    }
+    const names = body.listings[2].entries.map((e: any) => e.name).sort();
+    assert(JSON.stringify(names), JSON.stringify(["b", "sibling.md"]));
+  });
+
+  await test("reveal via CLI", () => {
+    const result = runJson("reveal /reveal/a/b/deep.md");
+    assert(result.stat.path, "/reveal/a/b/deep.md");
+    assert(result.listings.length, 4);
+  });
+
+  await test("reveal via API — 404 for missing file", async () => {
+    const res = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ op: "reveal", path: "/reveal/a/missing.md" }),
+    });
+    assert(res.status, 404, `Expected 404, got ${res.status}`);
+    assert(((await res.json()) as any).error, "NOT_FOUND");
+  });
+
+  await test("reveal via MCP", async () => {
+    const initRes = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "e2e-reveal", version: "1.0.0" },
+        },
+      }),
+    });
+    assert(initRes.ok, true, `MCP init failed: ${initRes.status}`);
+
+    const callRes = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "reveal", arguments: { path: "/reveal/a/b/deep.md" } },
+      }),
+    });
+    assert(callRes.ok, true, `MCP tools/call failed: ${callRes.status}`);
+    const body = await callRes.json() as any;
+    const parsed = JSON.parse(body.result?.content?.[0]?.text ?? "{}");
+    assert(parsed.path, "/reveal/a/b/deep.md");
+    assert(parsed.listings?.length, 4);
+  });
+
   // -- MIME type detection --
 
   await test("write sets contentType in stat", () => {
@@ -1640,6 +1988,449 @@ async function runStandardTests(daemonUrl: string) {
       assert(ct, "image/png", `Expected image/png, got ${ct}`);
     });
   }
+
+  // -- share links (public /share/:token preview) --
+
+  const shareDb = () => {
+    const db = new Database(join(testDir, "agent-fs.db"));
+    db.exec("PRAGMA busy_timeout=5000");
+    return db;
+  };
+  const shareBase = `http://127.0.0.1:${daemonPort}`;
+  const tokenFrom = (url: string) => url.split("/share/")[1];
+
+  await test("/health advertises server capabilities", async () => {
+    const health = await (await fetch(`${daemonUrl}/health`)).json() as any;
+    assert(health.features?.includes("share-links"), true, `Expected share-links in ${JSON.stringify(health)}`);
+    assert(health.features?.includes("comment-path-prefix"), true, `Expected comment-path-prefix in ${JSON.stringify(health)}`);
+    assert(health.features?.includes("drive-members"), true, `Expected drive-members in ${JSON.stringify(health)}`);
+    assert(health.features?.includes("comment-mentions"), true, `Expected comment-mentions in ${JSON.stringify(health)}`);
+    assert(health.features?.includes("favorites"), true, `Expected favorites in ${JSON.stringify(health)}`);
+  });
+
+  // -- favorites (per user; isolation between users is covered by the core and server tests) --
+
+  runJson('write /fav-e2e/a.md --content "a"');
+  runJson('write /fav-e2e/b.md --content "b"');
+
+  await test("favorite-add / favorite-list / favorite-remove round-trip", () => {
+    const file = runJson("favorite-add /fav-e2e/a.md");
+    assert(file.kind, "file");
+    assert(file.favorited, true);
+    const folder = runJson("favorite-add fav-e2e");
+    assert(folder.kind, "directory");
+    const list = runJson("favorite-list");
+    assert(list.favorites.map((f: any) => f.path).join(","), "/fav-e2e,/fav-e2e/a.md");
+    assertIncludes(run("favorite-list"), "/fav-e2e/");
+    assert(runJson("favorite-remove /fav-e2e").removed, true);
+    assert(runJson("favorite-remove /fav-e2e").removed, false);
+  });
+
+  await test("favorite-add fails for a missing path", () => {
+    let failed = false;
+    try {
+      run("favorite-add /fav-e2e/nope.md");
+    } catch {
+      failed = true;
+    }
+    assert(failed, true, "Expected favorite-add to fail for a missing path");
+  });
+
+  await test("a star follows mv and goes away on rm", () => {
+    runJson("mv /fav-e2e/a.md /fav-e2e/renamed.md");
+    assert(runJson("favorite-list").favorites.map((f: any) => f.path).join(","), "/fav-e2e/renamed.md");
+    runJson("rm /fav-e2e/renamed.md");
+    assert(runJson("favorite-list").favorites.length, 0);
+  });
+
+  runJson('write /share-e2e.md --content "# Shared heading\n\nHello <script>alert(1)</script> from **agent-fs**."');
+
+  await test("share-create returns a public link on the API host", () => {
+    const r = runJson("share-create /share-e2e.md");
+    assert(r.url.startsWith(`${shareBase}/share/`), true, `Expected an API-host URL, got ${r.url}`);
+    assert(r.path, "/share-e2e.md");
+    assert(r.expiresIn, 86400);
+    assert(r.maxViews, null);
+    assert(typeof r.id, "string");
+    assertIncludes(r.appUrl ?? "", "/file/~/", "Expected the viewer link alongside the share link (local mode has an app URL)");
+  });
+
+  await test("share-create fails for a missing file", () => {
+    try {
+      run("share-create /no-such-file.md");
+      throw new Error("Expected share-create to fail for a missing file");
+    } catch (e: any) {
+      if (e.message.includes("Expected share-create")) throw e;
+    }
+  });
+
+  await test("share-create rejects paths that climb out of the drive", () => {
+    for (const path of ["/no-such-dir/../share-e2e.md", "/../../../etc/passwd", "../../other/drives/x/secret.txt", "/a/./b", "/a\\..\\b"]) {
+      let failed = false;
+      try {
+        run(`share-create "${path}"`);
+      } catch {
+        failed = true;
+      }
+      assert(failed, true, `Expected share-create to reject ${path}`);
+    }
+  });
+
+  await test("GET /share/:token renders a hardened page without any credentials", async () => {
+    const r = runJson("share-create /share-e2e.md");
+    const res = await fetch(r.url); // no Authorization header
+    assert(res.status, 200);
+    assertIncludes(res.headers.get("content-type") ?? "", "text/html");
+    assert(res.headers.get("x-content-type-options"), "nosniff");
+    assert(res.headers.get("cache-control"), "no-store");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    assertIncludes(csp, "default-src 'none'");
+    // Only the page's own scripts run, allowed by hash: never inline-anything.
+    const scriptSrc = csp.split(";").map((d) => d.trim()).find((d) => d.startsWith("script-src ")) ?? "";
+    assert(/^script-src 'sha256-[^']+' 'sha256-[^']+'$/.test(scriptSrc), true, `Unexpected script-src: ${scriptSrc}`);
+    const body = await res.text();
+    assertIncludes(body, "<h1>share-e2e.md</h1>");
+    assertIncludes(body, '<h1 id="shared-heading">Shared heading');
+    assertIncludes(body, "<strong>agent-fs</strong>");
+    assertIncludes(body, `/share/${tokenFrom(r.url)}/download`);
+    assert((body.match(/<script\b/g) ?? []).length, 2, "Page must carry only its own two scripts");
+    assert(body.includes(apiKey), false, "Page must not contain the API key");
+    assert(body.includes(personalOrgId), false, "Page must not contain the org id");
+  });
+
+  await test("share download serves the file as an attachment", async () => {
+    const r = runJson("share-create /share-e2e.md");
+    const res = await fetch(`${r.url}/download`); // follows the presigned redirect on MinIO
+    assert(res.status, 200);
+    assert((res.headers.get("content-disposition") ?? "").startsWith("attachment;"), true, "Expected an attachment disposition");
+    assertIncludes(await res.text(), "Shared heading");
+  });
+
+  await test("share-create --one-off: first view works, second is expired", async () => {
+    const r = runJson("share-create /share-e2e.md --one-off");
+    assert(r.maxViews, 1);
+    const first = await fetch(r.url);
+    assert(first.status, 200);
+    const second = await fetch(r.url);
+    assert(second.status, 410);
+    assertIncludes(await second.text(), "This link has expired");
+  });
+
+  await test("share-create --one-off: bytes belong to the view that spent it, not to the link", async () => {
+    const r = runJson("share-create /share-e2e.md --one-off");
+    // Nothing before the page was opened, and the bare link never gets bytes.
+    assert((await fetch(`${r.url}/download`)).status, 403);
+    const first = await fetch(r.url);
+    assert(first.status, 200);
+    const grant = /\/download\?g=([A-Za-z0-9_-]{43})/.exec(await first.text())?.[1];
+    assert(!!grant, true, "Expected the page to carry a download grant");
+    for (let i = 0; i < 3; i++) {
+      assert((await fetch(`${r.url}/download`)).status, 410);
+    }
+    // The page that spent the view can still download its file.
+    const own = await fetch(`${r.url}/download?g=${grant}`);
+    assert(own.status, 200);
+    assertIncludes(await own.text(), "Shared heading");
+  });
+
+  await test("every share response carries a CSP, redirects and errors included", async () => {
+    const r = runJson("share-create /share-e2e.md");
+    for (const [what, url] of [
+      ["page", r.url],
+      ["download", `${r.url}/download`],
+      ["unknown token", `${shareBase}/share/${"A".repeat(43)}`],
+      ["unknown sub-route", `${r.url}/nope`],
+    ] as const) {
+      const res = await fetch(url, { redirect: "manual" });
+      assert(!!res.headers.get("content-security-policy"), true, `Expected a CSP on the ${what} response (${res.status})`);
+    }
+  });
+
+  await test("share --max-views N allows exactly N views", async () => {
+    const r = runJson("share-create /share-e2e.md --max-views 2");
+    const statuses = [(await fetch(r.url)).status, (await fetch(r.url)).status, (await fetch(r.url)).status];
+    assert(statuses.join(","), "200,200,410");
+  });
+
+  await test("an expired share renders 'link expired'", async () => {
+    const r = runJson("share-create /share-e2e.md --expires-in 60");
+    assert((await fetch(r.url)).status, 200);
+    const db = shareDb();
+    db.prepare("UPDATE shares SET expires_at = ? WHERE id = ?").run(Math.floor(Date.now() / 1000) - 10, r.id);
+    db.close();
+    const res = await fetch(r.url);
+    assert(res.status, 410);
+    assertIncludes(await res.text(), "This link has expired");
+    assert((await fetch(`${r.url}/download`)).status, 410);
+  });
+
+  await test("share-revoke stops a link immediately (by id and by URL)", async () => {
+    const byId = runJson("share-create /share-e2e.md");
+    assert((await fetch(byId.url)).status, 200);
+    assert(runJson(`share-revoke ${byId.id}`).revoked, 1);
+    assert((await fetch(byId.url)).status, 410);
+    assert((await fetch(`${byId.url}/download`)).status, 410);
+
+    const byUrl = runJson("share-create /share-e2e.md");
+    assert(runJson(`share-revoke --token ${byUrl.url}`).revoked, 1);
+    assert((await fetch(byUrl.url)).status, 410);
+    // idempotent
+    assert(runJson(`share-revoke ${byId.id}`).revoked, 0);
+  });
+
+  await test("share-revoke --path revokes every link of a file", async () => {
+    runJson('write /share-e2e-multi.txt --content "multi"');
+    const a = runJson("share-create /share-e2e-multi.txt");
+    const b = runJson("share-create /share-e2e-multi.txt");
+    assert(runJson("share-revoke --path /share-e2e-multi.txt").revoked, 2);
+    assert((await fetch(a.url)).status, 410);
+    assert((await fetch(b.url)).status, 410);
+  });
+
+  await test("unknown share tokens get the expired page, not a server error", async () => {
+    const res = await fetch(`${shareBase}/share/${"A".repeat(43)}`);
+    assert(res.status, 404);
+    assertIncludes(await res.text(), "This link has expired");
+  });
+
+  await test("SVG files are download-only, never previewed", async () => {
+    runJson(`write /share-e2e.svg --content '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'`);
+    const r = runJson("share-create /share-e2e.svg");
+    const res = await fetch(r.url);
+    assert(res.status, 200);
+    const body = await res.text();
+    assertIncludes(body, "No preview available");
+    assert(body.includes("alert(1)"), false, "SVG source must not be rendered into the page");
+    assert((await fetch(`${r.url}/raw`)).status, 404);
+  });
+
+  await test("HTML files render in a sandboxed frame served by /raw", async () => {
+    runJson('write /share-e2e.html --content "<html><script>alert(1)</script></html>"');
+    const r = runJson("share-create /share-e2e.html");
+    const res = await fetch(r.url);
+    assert(res.status, 200);
+    const body = await res.text();
+    assert(body.includes("alert(1)"), false, "HTML source must not be inlined into the page");
+    assertIncludes(body, `src="${new URL(r.url).pathname}/raw"`);
+    assertIncludes(res.headers.get("content-security-policy") ?? "", "frame-src 'self'");
+    // Proxied on every backend (no presigned redirect): only this host can add the sandbox.
+    const raw = await fetch(`${r.url}/raw`, { redirect: "manual" });
+    assert(raw.status, 200);
+    assertIncludes(raw.headers.get("content-type") ?? "", "text/html");
+    const csp = raw.headers.get("content-security-policy") ?? "";
+    assertIncludes(csp, "sandbox allow-scripts");
+    assert(csp.includes("allow-same-origin"), false, "HTML must get an opaque origin");
+    assertIncludes(await raw.text(), "alert(1)");
+  });
+
+  await test("every share view is recorded as a share_viewed event", async () => {
+    const r = runJson("share-create /share-e2e.md --max-views 3");
+    await fetch(r.url);
+    await fetch(r.url);
+    const db = shareDb();
+    const rows = db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'share_viewed' AND resource_id = ?").get(r.id) as { n: number };
+    db.close();
+    assert(rows.n, 2);
+  });
+
+  await test("share-create via API and MCP", async () => {
+    const apiRes = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ op: "share-create", path: "/share-e2e.md", expiresIn: 3600, maxViews: 5 }),
+    });
+    assert(apiRes.status, 200);
+    const api = await apiRes.json() as any;
+    assert(api.expiresIn, 3600);
+    assert(api.maxViews, 5);
+
+    const bad = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ op: "share-create", path: "/share-e2e.md", expiresIn: 999999 }),
+    });
+    assert(bad.ok, false, "expiresIn above 7 days must be rejected");
+
+    await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e-share", version: "1.0.0" } },
+      }),
+    });
+    const mcp = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "share-create", arguments: { path: "/share-e2e.md", maxViews: 1 } },
+      }),
+    });
+    const mcpBody = await mcp.json() as any;
+    const parsed = JSON.parse(mcpBody.result.content[0].text);
+    assert(parsed.url.startsWith(`${shareBase}/share/`), true, `Expected an API-host URL from MCP, got ${parsed.url}`);
+    assert(parsed.maxViews, 1);
+  });
+
+  // -- site shares (a shared folder served at /site/:token/) --
+
+  await test("/health advertises html-sites", async () => {
+    const health = await (await fetch(`${daemonUrl}/health`)).json() as any;
+    assert(health.features?.includes("html-sites"), true, `Expected html-sites in ${JSON.stringify(health)}`);
+  });
+
+  runJson(`write /site-e2e/index.html --content '<!doctype html><title>Site E2E</title><script src="app.js"></script><p>site-e2e-index</p>'`);
+  runJson(`write /site-e2e/app.js --content 'fetch("data.json").then((r) => r.json()).then((d) => console.log(d.ok));'`);
+  runJson(`write /site-e2e/data.json --content '{"ok":true}'`);
+  runJson(`write /site-e2e/sub/index.html --content '<!doctype html><p>site-e2e-sub</p>'`);
+
+  await test("share-create on a folder returns a site share", () => {
+    const r = runJson("share-create site-e2e");
+    assert(r.kind, "site");
+    assertIncludes(r.url, "/site/", `Expected a /site/ URL, got ${r.url}`);
+    assert(r.url.startsWith(`${shareBase}/site/`), true, `Expected an API-host URL, got ${r.url}`);
+    assert(r.url.endsWith("/"), true, `Expected a trailing slash, got ${r.url}`);
+    assert(r.maxViews, null);
+  });
+
+  await test("GET /site/:token/ serves index.html with the sandbox CSP, no credentials", async () => {
+    const r = runJson("share-create site-e2e");
+    const res = await fetch(r.url); // no Authorization header
+    assert(res.status, 200);
+    assertIncludes(res.headers.get("content-type") ?? "", "text/html");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    assertIncludes(csp, "sandbox allow-scripts");
+    assert(csp.includes("allow-same-origin"), false, `CSP must not allow same origin: ${csp}`);
+    assert(res.headers.get("referrer-policy"), "no-referrer");
+    assert(res.headers.get("x-content-type-options"), "nosniff");
+    assert(res.headers.get("access-control-allow-origin"), "*");
+    assert(res.headers.get("x-frame-options"), null);
+    assertIncludes(await res.text(), "site-e2e-index");
+  });
+
+  await test("site assets resolve inside the folder", async () => {
+    const r = runJson("share-create site-e2e");
+    const js = await fetch(`${r.url}app.js`);
+    assert(js.status, 200);
+    assertIncludes(js.headers.get("content-type") ?? "", "javascript");
+    assertIncludes(await js.text(), 'fetch("data.json")');
+
+    const data = await fetch(`${r.url}data.json`);
+    assert(data.status, 200);
+    assertIncludes(data.headers.get("content-type") ?? "", "application/json");
+    assert((await data.json() as any).ok, true);
+
+    const sub = await fetch(`${r.url}sub`, { redirect: "manual" });
+    assert(sub.status, 301);
+    assert((sub.headers.get("location") ?? "").endsWith("/sub/"), true, `Expected a redirect to sub/, got ${sub.headers.get("location")}`);
+    const subIndex = await fetch(`${r.url}sub/`);
+    assert(subIndex.status, 200);
+    assertIncludes(await subIndex.text(), "site-e2e-sub");
+  });
+
+  await test("a site folder without index.html opens its lone page or lists its pages", async () => {
+    runJson(`write /site-e2e-lone/radar.html --content '<p>site-e2e-radar</p>'`);
+    runJson(`write /site-e2e-lone/chart.png --content 'fake-png'`);
+    const lone = runJson("share-create site-e2e-lone");
+    const redirect = await fetch(lone.url, { redirect: "manual" });
+    assert(redirect.status, 302);
+    assert(redirect.headers.get("location"), "radar.html");
+    assertIncludes(await (await fetch(lone.url)).text(), "site-e2e-radar");
+
+    runJson(`write /site-e2e-lone/other.html --content '<p>other</p>'`);
+    const listing = await fetch(lone.url, { redirect: "manual" });
+    assert(listing.status, 200);
+    const body = await listing.text();
+    assertIncludes(body, '<a href="radar.html">radar.html</a>');
+    assertIncludes(body, '<a href="other.html">other.html</a>');
+    assert(body.includes("chart.png"), false, "Only HTML pages are listed");
+  });
+
+  await test("site paths cannot climb out of the shared folder", async () => {
+    const r = runJson("share-create site-e2e");
+    for (const rest of ["..%2Fshare-e2e.md", "%2e%2e%2Fshare-e2e.md", "%252e%252e%252Fshare-e2e.md", "sub%2F..%2F..%2Fshare-e2e.md"]) {
+      const res = await fetch(`${r.url}${rest}`, { redirect: "manual" });
+      const body = await res.text();
+      assert([400, 404].includes(res.status), true, `Expected 400 or 404 for ${rest}, got ${res.status}`);
+      assert(body.includes("Shared heading"), false, `${rest} leaked bytes from outside the folder`);
+    }
+  });
+
+  await test("share-create rejects --max-views on a folder", () => {
+    let failed = false;
+    try {
+      run("share-create site-e2e --max-views 1");
+    } catch {
+      failed = true;
+    }
+    assert(failed, true, "Expected share-create --max-views on a folder to fail");
+  });
+
+  await test("share-revoke --path on a folder stops the site", async () => {
+    const r = runJson("share-create site-e2e");
+    assert((await fetch(r.url)).status, 200);
+    const revoked = runJson("share-revoke --path site-e2e");
+    assert(revoked.revoked >= 1, true, `Expected at least one revoked share, got ${JSON.stringify(revoked)}`);
+    const res = await fetch(r.url);
+    assert(res.status, 410);
+    assert((await fetch(`${r.url}app.js`)).status, 410);
+  });
+
+  await test("site views write no share_viewed events", async () => {
+    const r = runJson("share-create site-e2e");
+    await fetch(r.url);
+    await fetch(`${r.url}app.js`);
+    const db = shareDb();
+    const events = db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'share_viewed' AND resource_id = ?").get(r.id) as { n: number };
+    const row = db.prepare("SELECT views FROM shares WHERE id = ?").get(r.id) as { views: number };
+    db.close();
+    assert(events.n, 0);
+    assert(row.views, 0);
+  });
+
+  await test("site share-create via API and MCP", async () => {
+    const apiRes = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ op: "share-create", path: "/site-e2e", expiresIn: 3600 }),
+    });
+    assert(apiRes.status, 200);
+    const api = await apiRes.json() as any;
+    assert(api.kind, "site");
+    assert(api.sharePath.startsWith("/site/"), true, `Expected a /site/ sharePath, got ${api.sharePath}`);
+    assert(api.expiresIn, 3600);
+    assert((await fetch(api.url)).status, 200);
+
+    const bad = await fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ op: "share-create", path: "/site-e2e", maxViews: 1 }),
+    });
+    assert(bad.ok, false, "maxViews on a folder must be rejected");
+
+    await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e-site", version: "1.0.0" } },
+      }),
+    });
+    const mcp = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(apiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "share-create", arguments: { path: "/site-e2e" } },
+      }),
+    });
+    const mcpBody = await mcp.json() as any;
+    const parsed = JSON.parse(mcpBody.result.content[0].text);
+    assert(parsed.kind, "site");
+    assert(parsed.url.startsWith(`${shareBase}/site/`), true, `Expected a /site/ URL from MCP, got ${parsed.url}`);
+    assert((await fetch(parsed.url)).status, 200);
+  });
 
   // Daemon /raw route must declare a charset on text responses, or the
   // browser's anchor-download path falls back to a locale default (cp1252 on
@@ -2629,6 +3420,45 @@ async function runStandardTests(daemonUrl: string) {
     assert(res.ok, true, `Expected 200, got ${res.status}`);
   });
 
+  await test("drive-members works for viewers over HTTP and CLI without roles", async () => {
+    const apiRes = await fetch(`${daemonUrl}/orgs/${secondOrgId}/ops`, {
+      method: "POST",
+      headers: authed(user3ApiKey),
+      body: JSON.stringify({ op: "drive-members", driveId: secondDriveId }),
+    });
+    assert(apiRes.status, 200, `Expected 200, got ${apiRes.status}`);
+    const apiMembers = ((await apiRes.json()) as any).members;
+    assert(apiMembers.some((member: any) => member.email === "user3@e2e.local"), true);
+    assert(apiMembers.some((member: any) => "role" in member), false, "drive-members must not expose roles");
+    assert(apiMembers.every((member: any) => "displayName" in member), true, "Expected displayName on every member");
+
+    const cli = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} members`,
+      { AGENT_FS_API_KEY: user3ApiKey },
+    ));
+    assert(cli.members.length, apiMembers.length);
+    assert(cli.members.some((member: any) => "role" in member), false, "CLI must not expose roles");
+  });
+
+  await test("drive-members works over MCP", async () => {
+    const response = await fetch(`${daemonUrl}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders(user3ApiKey),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "drive-members", arguments: {} },
+      }),
+    });
+    assert(response.ok, true, `MCP drive-members failed: ${response.status}`);
+    const body = await response.json() as any;
+    assert(body.result?.isError === true, false, "MCP drive-members returned an operation error");
+    const members = JSON.parse(body.result.content[0].text).members;
+    assert(members.some((member: any) => member.email === "user3@e2e.local"), true);
+    assert(members.some((member: any) => "role" in member), false, "MCP must not expose roles");
+  });
+
   let rbacDriveId = "";
   await test("rbac: strict membership — new drive visible to creator only", async () => {
     // Created AFTER user3's invite, so user3 has no membership row on it.
@@ -2764,6 +3594,29 @@ async function runStandardTests(daemonUrl: string) {
     assert(((await res.json()) as any).error, "PERMISSION_DENIED");
   });
 
+  await test("rbac: reveal follows ls — viewer allowed, non-member denied like ls", async () => {
+    const viewerRes = await fetch(`${daemonUrl}/orgs/${secondOrgId}/ops`, {
+      method: "POST",
+      headers: authed(user3ApiKey),
+      body: JSON.stringify({ op: "reveal", path: "/rbac-probe.txt" }),
+    });
+    assert(viewerRes.status, 200, `Expected 200, got ${viewerRes.status}`);
+    assert(((await viewerRes.json()) as any).stat.path, "/rbac-probe.txt");
+
+    // user3 has no access to user1's personal org: reveal must fail exactly as ls does.
+    const call = (op: string, extra: Record<string, unknown>) =>
+      fetch(`${daemonUrl}/orgs/${personalOrgId}/ops`, {
+        method: "POST",
+        headers: authed(user3ApiKey),
+        body: JSON.stringify({ op, ...extra }),
+      });
+    const lsRes = await call("ls", { path: "/" });
+    const revealRes = await call("reveal", { path: "/hello.txt" });
+    assert(lsRes.ok, false, "Expected ls to be denied for a non-member");
+    assert(revealRes.status, lsRes.status, `reveal ${revealRes.status} vs ls ${lsRes.status}`);
+    assert(((await revealRes.json()) as any).error, ((await lsRes.json()) as any).error);
+  });
+
   await test("rbac: comment notifications are target and drive scoped", async () => {
     const addRes = await fetch(`${daemonUrl}/orgs/${secondOrgId}/ops`, {
       method: "POST",
@@ -2878,6 +3731,52 @@ async function runStandardTests(daemonUrl: string) {
     const readNotification = afterRead.notifications.find((entry: any) => entry.id === notification.id);
     assert(!!readNotification, true, "Expected acknowledged notification in the full list");
     assert(readNotification.read, true, "Expected notification to be marked read");
+  });
+
+  await test("comment mentions work through CLI add, list, notifications, and read", () => {
+    const add = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment add /rbac-probe.txt --body "mention e2e" --mention USER3@E2E.LOCAL`,
+      { AGENT_FS_API_KEY: apiKey },
+    ));
+    assert(typeof add.id, "string", "Expected comment ID");
+
+    const comments = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment list /rbac-probe.txt`,
+      { AGENT_FS_API_KEY: apiKey },
+    ));
+    const comment = comments.comments.find((entry: any) => entry.id === add.id);
+    assert(comment?.mentions?.[0]?.email, "user3@e2e.local", "Expected resolved mention profile");
+
+    const mentionInbox = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment notifications --kind mention`,
+      { AGENT_FS_API_KEY: user3ApiKey },
+    ));
+    const mention = mentionInbox.notifications.find((entry: any) => entry.commentId === add.id);
+    assert(!!mention, true, "Expected targeted mention notification");
+    assert(mention.kind, "mention");
+    assert(mention.read, false);
+
+    const defaultInbox = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment notifications`,
+      { AGENT_FS_API_KEY: user3ApiKey },
+    ));
+    const broadcast = defaultInbox.notifications.find((entry: any) => entry.commentId === add.id);
+    assert(!!broadcast, true, "Expected existing broadcast notification by default");
+    assert(broadcast.kind, "comment");
+
+    JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment read ${mention.id}`,
+      { AGENT_FS_API_KEY: user3ApiKey },
+    ));
+    const afterRead = JSON.parse(runWithEnv(
+      `--json --org ${secondOrgId} --drive ${secondDriveId} comment notifications --kind mention --unread`,
+      { AGENT_FS_API_KEY: user3ApiKey },
+    ));
+    assert(
+      afterRead.notifications.some((entry: any) => entry.id === mention.id),
+      false,
+      "Expected the read mention to leave the unread inbox",
+    );
   });
 
   await test("rbac: comment IDs are org/drive scoped (cross-tenant 404)", async () => {
@@ -3026,6 +3925,18 @@ async function coreOpsSuite(b: Backend) {
     assert(s.currentVersion >= 3, true, `expected version >= 3, got ${s.currentVersion}`);
   });
 
+  await test(`[${b.label}] stat on a folder is NOT_FOUND`, async () => {
+    // ${P}/sub is a folder (see the ls test). The local backend used to stat
+    // it as a file, so the just-bash adapter refused writes inside it.
+    const res = await fetch(`http://127.0.0.1:${b.daemonPort}/orgs/${b.orgId}/ops`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${b.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ op: "stat", driveId: b.driveId, path: `${P}/sub` }),
+    });
+    assert(res.status, 404, `expected 404, got ${res.status}`);
+    assert(((await res.json()) as any).error, "NOT_FOUND");
+  });
+
   await test(`[${b.label}] cp + cat`, () => {
     rj(`cp ${P}/hello.txt ${P}/hello-copy.txt`);
     assert(rj(`cat ${P}/hello-copy.txt`).content, "Hello, agent-fs! Edited!");
@@ -3044,6 +3955,11 @@ async function coreOpsSuite(b: Backend) {
     assert(paths.includes(`${P}/hello.txt`), true, `expected ${P}/hello.txt in glob, got ${JSON.stringify(paths)}`);
   });
 
+  await test(`[${b.label}] find`, () => {
+    const paths = rj(`find HELLO --path ${P}`).matches.map((m: any) => m.path);
+    assert(paths.includes(`${P}/hello.txt`), true, `expected ${P}/hello.txt in find, got ${JSON.stringify(paths)}`);
+  });
+
   await test(`[${b.label}] recent`, () => {
     assert(rj(`recent`).entries.length > 0, true, "expected recent entries");
   });
@@ -3057,6 +3973,7 @@ async function coreOpsSuite(b: Backend) {
     const d = rj(`diff ${P}/hello.txt --v1 1 --v2 2`);
     assert(Array.isArray(d.changes), true);
     assert(d.changes.length > 0, true, "expected real content diff between v1 and v2");
+    assert(d.source, "content");
   });
 
   // -- Tier: revert restores prior content AS A NEW VERSION (not a rewind) --
@@ -3122,6 +4039,16 @@ async function unsupportedOpSuite() {
     assert(body.error, "UNSUPPORTED_OPERATION");
     assert(body.operation, "revert");
   });
+
+  await test(`[capped] diff of a write pair reports source=none and warns on stderr`, () => {
+    runJsonOn(capped, `write /cap.txt --content "v2"`);
+    const d = runJsonOn(capped, `diff /cap.txt --v1 1 --v2 2`);
+    assert(d.source, "none");
+    assert(d.changes.length, 0);
+    // Only stderr: the warning must not contaminate the JSON on stdout.
+    const stderr = runOn(capped, `--json diff /cap.txt --v1 1 --v2 2 2>&1 1>/dev/null`);
+    assertIncludes(stderr, "not compared", "expected a not-compared warning on stderr");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3153,6 +4080,144 @@ async function signedUrlMatrix(minio: Backend | undefined, local: Backend) {
     assert(res.kind, "app", `expected app-URL fallback, got kind=${res.kind}`);
     assert(res.expiresIn, 0);
     assertIncludes(res.url, "/file/~/", "expected an in-app (non-presigned) link");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Local storage tenant containment
+//
+// Every drive is a sibling directory (`<org>/drives/<drive>/`) under ONE local
+// storage root, so a `.`/`..` segment in a path used to reach another tenant's
+// drive on any op. Two real users on a real daemon: the attacker climbs out of
+// their own drive over the JSON ops API and the raw file route, and the
+// victim's bytes must stay untouched and undisclosed. Legitimate dotted names
+// must keep working. (S3 is not covered here: an `a/../b` key is ordinary data
+// there and its adapter is unchanged.)
+// ---------------------------------------------------------------------------
+
+async function localContainmentSuite(b: Backend) {
+  console.log(`\n-- local storage tenant containment [${b.label}] --`);
+  const url = `http://127.0.0.1:${b.daemonPort}`;
+  const storageRoot = join(b.home, "storage");
+  const SECRET = "VICTIM-SECRET-BYTES";
+
+  const post = (key: string, orgId: string, body: Record<string, unknown>) =>
+    fetch(`${url}/orgs/${orgId}/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+    });
+
+  const reg = await fetch(`${url}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: `victim-${b.label}@e2e.local` }),
+  });
+  const victim = (await reg.json()) as { apiKey: string; orgId: string };
+  const vDrives = (await (
+    await fetch(`${url}/orgs/${victim.orgId}/drives`, { headers: { Authorization: `Bearer ${victim.apiKey}` } })
+  ).json()) as any;
+  const victimDriveId: string = vDrives.drives[0].id;
+  const victimDir = `${victim.orgId}/drives/${victimDriveId}`;
+  const victimKey = `${victimDir}/secret.txt`;
+
+  const wr = await post(victim.apiKey, victim.orgId, { op: "write", path: "/secret.txt", content: SECRET });
+  if (!wr.ok) throw new Error(`victim write failed: ${wr.status} ${await wr.text()}`);
+  const mine = await post(b.apiKey, b.orgId, { op: "write", path: "/mine.txt", content: "attacker file" });
+  if (!mine.ok) throw new Error(`attacker write failed: ${mine.status} ${await mine.text()}`);
+
+  const victimDiskDir = join(storageRoot, victimDir);
+  const victimState = () => JSON.stringify(readdirSync(victimDiskDir).sort()) + readFileSync(join(storageRoot, victimKey), "utf-8");
+  const untouched = victimState();
+
+  // Three segments deep: org, "drives", drive.
+  const up = "../../..";
+  const hostile: Array<[string, string, string]> = [
+    // [name, path to the victim's file, path to the victim's drive directory]
+    ["climb", `/${up}/${victimKey}`, `/${up}/${victimDir}`],
+    ["no leading slash", `${up}/${victimKey}`, `${up}/${victimDir}`],
+    ["dot segments mixed in", `/./${up.replaceAll("/", "/./")}/./${victimKey}`, `/./${up.replaceAll("/", "/./")}/./${victimDir}`],
+    ["via a real directory", `/x/../${up}/${victimKey}`, `/x/../${up}/${victimDir}`],
+    ["backslashes", `/${up.replaceAll("/", "\\")}\\${victimKey.replaceAll("/", "\\")}`, `/${up.replaceAll("/", "\\")}\\${victimDir.replaceAll("/", "\\")}`],
+  ];
+
+  const fileOps: Array<[string, (p: string) => Record<string, unknown>]> = [
+    ["cat", (p) => ({ op: "cat", path: p })],
+    ["tail", (p) => ({ op: "tail", path: p })],
+    ["stat", (p) => ({ op: "stat", path: p })],
+    ["write", (p) => ({ op: "write", path: p, content: "PWNED" })],
+    ["append", (p) => ({ op: "append", path: p, content: "PWNED" })],
+    ["edit", (p) => ({ op: "edit", path: p, old_string: "VICTIM", new_string: "PWNED" })],
+    ["rm", (p) => ({ op: "rm", path: p })],
+    ["cp from", (p) => ({ op: "cp", from: p, to: "/stolen.txt" })],
+    ["cp to", (p) => ({ op: "cp", from: "/mine.txt", to: p })],
+    ["mv from", (p) => ({ op: "mv", from: p, to: "/stolen.txt" })],
+    ["mv to", (p) => ({ op: "mv", from: "/mine.txt", to: p })],
+  ];
+  const dirOps: Array<[string, (p: string) => Record<string, unknown>]> = [
+    ["ls", (p) => ({ op: "ls", path: p })],
+    ["tree", (p) => ({ op: "tree", path: p })],
+    ["glob", (p) => ({ op: "glob", pattern: "*", path: p })],
+  ];
+
+  for (const [formName, filePath, dirPath] of hostile) {
+    await test(`[${b.label}] hostile path (${formName}) is refused by every op and the other drive is untouched`, async () => {
+      for (const [opName, build] of fileOps) {
+        const res = await post(b.apiKey, b.orgId, build(filePath));
+        const text = await res.text();
+        assert(res.status, 400, `${opName}: expected 400, got ${res.status}: ${text.slice(0, 120)}`);
+        assert(JSON.parse(text).error, "VALIDATION_ERROR", `${opName}: ${text.slice(0, 120)}`);
+        assert(text.includes(SECRET), false, `${opName} leaked the other tenant's bytes`);
+      }
+      for (const [opName, build] of dirOps) {
+        const res = await post(b.apiKey, b.orgId, build(dirPath));
+        const text = await res.text();
+        assert(res.status, 400, `${opName}: expected 400, got ${res.status}: ${text.slice(0, 120)}`);
+        assert(JSON.parse(text).error, "VALIDATION_ERROR", `${opName}: ${text.slice(0, 120)}`);
+      }
+      assert(victimState(), untouched, "the victim's drive changed on disk");
+      // ...and it is still the victim's, readable by them.
+      const own = await post(victim.apiKey, victim.orgId, { op: "cat", path: "/secret.txt" });
+      assert(((await own.json()) as any).content, SECRET);
+    });
+  }
+
+  await test(`[${b.label}] GET /files/.../raw cannot read another tenant's drive`, async () => {
+    // `..%2f` / `..%5c` survive URL parsing (a literal `../` would be collapsed
+    // before it ever reached the server), so the route decodes them itself.
+    for (const enc of [
+      `${encodeURIComponent(`${up}/${victimKey}`)}`,
+      `${encodeURIComponent(`${up}/${victimKey}`.replaceAll("/", "\\"))}`,
+    ]) {
+      const res = await fetch(`${url}/orgs/${b.orgId}/drives/${b.driveId}/files/${enc}/raw`, {
+        headers: { Authorization: `Bearer ${b.apiKey}` },
+      });
+      const text = await res.text();
+      assert(res.status, 400, `expected 400, got ${res.status}: ${text.slice(0, 120)}`);
+      assert(text.includes(SECRET), false, "raw route leaked the other tenant's bytes");
+    }
+    assert(victimState(), untouched, "the victim's drive changed on disk");
+  });
+
+  await test(`[${b.label}] a NUL byte in a path is refused`, async () => {
+    const res = await post(b.apiKey, b.orgId, { op: "cat", path: "/notes\u0000.txt" });
+    assert(res.status, 400, `expected 400, got ${res.status}`);
+  });
+
+  await test(`[${b.label}] names that merely contain dots keep working`, async () => {
+    for (const path of ["/.env", "/a.b", "/..foo", "/file..", "/dir../x.txt", "/.hidden/notes..md"]) {
+      const w = await post(b.apiKey, b.orgId, { op: "write", path, content: "ok" });
+      assert(w.status, 200, `write ${path}: ${w.status} ${await w.text()}`);
+      const c = await post(b.apiKey, b.orgId, { op: "cat", path });
+      assert(((await c.json()) as any).content, "ok", `cat ${path}`);
+    }
+    // through the CLI as well, so the whole path (CLI -> daemon -> adapter) is exercised
+    runJsonOn(b, `write /.cli-env --content cli-ok`);
+    assert(runJsonOn(b, `cat /.cli-env`).content, "cli-ok");
+    const names = runJsonOn(b, `ls /`).entries.map((e: any) => e.name);
+    for (const n of [".env", "a.b", "..foo", "file..", "dir..", ".hidden", ".cli-env"]) {
+      assert(names.includes(n), true, `expected ${n} in ls /, got ${JSON.stringify(names)}`);
+    }
   });
 }
 

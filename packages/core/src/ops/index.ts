@@ -7,6 +7,7 @@ import { edit } from "./edit.js";
 import { append } from "./append.js";
 import { ls } from "./ls.js";
 import { stat } from "./stat.js";
+import { reveal } from "./reveal.js";
 import { rm } from "./rm.js";
 import { mv } from "./mv.js";
 import { cp } from "./cp.js";
@@ -22,8 +23,10 @@ import { search } from "./search.js";
 import { reindex } from "./reindex.js";
 import { tree } from "./tree.js";
 import { glob } from "./glob.js";
+import { find } from "./find.js";
 import { sql } from "./sql.js";
 import { signedUrl } from "./signed-url.js";
+import { shareCreate, shareRevoke } from "./share.js";
 import { buildAppUrl } from "./urls.js";
 import { recordOp } from "../telemetry.js";
 import {
@@ -38,6 +41,8 @@ import {
   commentNotificationList,
   commentNotificationRead,
 } from "./comment-notification.js";
+import { driveMembers } from "./drive-members.js";
+import { favoriteAdd, favoriteRemove, favoriteList } from "./favorite.js";
 
 export interface OpDefinition {
   description: string;
@@ -92,8 +97,13 @@ const opRegistry: Record<string, OpDefinition> = {
     schema: z.object({ path: z.string().optional() }),
   },
   stat: {
-    description: "Get file metadata without reading content. Returns path, size, contentType, author, currentVersion, createdAt, modifiedAt, isDeleted, embeddingStatus.",
+    description: "Get file metadata without reading content. Returns path, size, contentType, author, currentVersion, createdAt, modifiedAt, isDeleted, embeddingStatus, etag (opaque id of the current bytes, compare for equality). Embedding status is pending, indexed, failed, or skipped.",
     handler: stat,
+    schema: z.object({ path: z.string() }),
+  },
+  reveal: {
+    description: "Everything needed to show one file in a tree, in one call: the ls listing of every ancestor directory (root first) plus the file's stat. Returns { path, stat, listings } where each listing is { path, entries } with entries shaped exactly like ls.",
+    handler: reveal,
     schema: z.object({ path: z.string() }),
   },
   rm: {
@@ -140,7 +150,7 @@ const opRegistry: Record<string, OpDefinition> = {
     }),
   },
   diff: {
-    description: "Show the diff between two versions of a file. Specify v1 and v2 version numbers. Returns { changes } as add/remove/context hunks.",
+    description: "Show the diff between two versions of a file. Specify v1 and v2 version numbers. Returns { changes, source } as add/remove/context hunks; when file content was diffed each change carries oldLine/newLine. source is 'content' when both versions were compared, 'summary' when changes come from the stored edit summary, or 'none' when the versions were not compared at all. Only source 'content' with empty changes means the versions are identical.",
     handler: diff,
     schema: z.object({
       path: z.string(),
@@ -199,7 +209,7 @@ const opRegistry: Record<string, OpDefinition> = {
     }),
   },
   reindex: {
-    description: "Re-index files with failed or missing FTS5/embedding entries. Optionally scope to a path prefix. Use after bulk writes or provider changes.",
+    description: "Re-index files with failed or missing FTS5/embedding entries. Skip files with indexed or skipped status. Optionally scope to a path prefix. Use after bulk writes or provider changes.",
     handler: reindex,
     schema: z.object({
       path: z.string().optional(),
@@ -214,11 +224,20 @@ const opRegistry: Record<string, OpDefinition> = {
     }),
   },
   glob: {
-    description: "Find files by name pattern. Use `*.md` for root-level files only, `**/*.md` for recursive matching across all subdirectories. Supports `*` (any chars except /), `?` (single char), `**` (any path depth). Optionally scope to a path prefix. Returns { matches } with path, size, and modifiedAt.",
+    description: "Find files by name pattern. Use `*.md` for root-level files only, `**/*.md` for recursive matching across all subdirectories. Supports `*` (any chars except /), `?` (single char), `**` (any path depth). Optionally scope to a path prefix. Case-sensitive. To look up a file by an approximate name, use find. Returns { matches } with path, size, and modifiedAt.",
     handler: glob,
     schema: z.object({
       pattern: z.string(),
       path: z.string().optional(),
+    }),
+  },
+  find: {
+    description: "Find files by approximate name. Matching is case- and accent-insensitive. Every query word must match the path, in any order. When no file has every word as typed, letters can be skipped (\"zphr\" finds \"Zephyr.pdf\"). File-name hits rank above folder hits. Optionally scope to a path prefix. Returns { matches, total }: matches holds path, size, modifiedAt, and score, best first, capped at limit (default 50). total counts all matching files.",
+    handler: find,
+    schema: z.object({
+      query: z.string().min(1),
+      path: z.string().optional(),
+      limit: z.number().int().min(1).max(500).optional(),
     }),
   },
   sql: {
@@ -251,29 +270,62 @@ const opRegistry: Record<string, OpDefinition> = {
       disposition: z.enum(["inline", "attachment"]).optional(),
     }),
   },
+  "share-create": {
+    description: "Create a public share link for a file or folder. A file gets an unauthenticated /share/<token> page on the API host with a preview (markdown, text/code, image, PDF, audio, video, and HTML pages rendered in a sandboxed frame with only that file shared) and a Download button. A folder becomes an HTML site (kind \"site\") at /site/<token>/: index.html is the entry page (without one, the only HTML page opens, or else a list of the HTML pages), relative paths resolve inside the folder, and pages run in a sandbox with no cookies or localStorage. A site page can read every file under its folder while the link is valid. Default expiry is 24 hours (max 7 days); set maxViews to limit how often a file page can be opened (maxViews=1 is a one-off link; folders reject maxViews). Anyone with the link can open it, so share deliberately. Returns { id, kind, url, sharePath, path, expiresIn, expiresAt, maxViews }. The link is shown only once; keep the id to revoke it.",
+    handler: shareCreate,
+    schema: z.object({
+      path: z.string(),
+      expiresIn: z.number().int().min(60).max(604800).optional(),
+      maxViews: z.number().int().min(1).max(1000000).optional(),
+    }),
+  },
+  "share-revoke": {
+    description: "Revoke share links so they stop working immediately. Pass exactly one of: id (from share-create), token (the token or the full share URL), or path (revokes every link to that file or folder). Only the link's creator or a drive admin can revoke. Returns { revoked, ids }.",
+    handler: shareRevoke,
+    schema: z.object({
+      id: z.string().optional(),
+      token: z.string().optional(),
+      path: z.string().optional(),
+    }),
+  },
   "comment-add": {
-    description: "Add a comment to a file. Supports line ranges and threading via parentId. Replies auto-resolve path from parent. Returns { id, path, body, author, createdAt }.",
+    description: "Add a comment to a file. Supports line ranges, a text-quote anchor ({ exact, prefix, suffix }), mentions by drive-member user ID or email, and threading via parentId. Replies auto-resolve path from parent. Returns { id, path, body, author, createdAt }.",
     handler: commentAdd,
     schema: z.object({
       path: z.string().optional(),
       body: z.string(),
       parentId: z.string().optional(),
+      mentions: z.array(z.string().min(1)).max(20).optional(),
       lineStart: z.number().int().optional(),
       lineEnd: z.number().int().optional(),
       quotedContent: z.string().optional(),
+      quote: z
+        .object({
+          exact: z.string(),
+          prefix: z.string().optional(),
+          suffix: z.string().optional(),
+        })
+        .optional()
+        .describe("Text-quote anchor: the exact selected text plus ~32 chars of context before (prefix) and after (suffix). Lets viewers re-find the selection after the file is edited."),
     }),
   },
   "comment-list": {
-    description: "List comments on a file. Filter by path, resolved state, or parentId. Defaults to unresolved root comments. Returns { comments } with inline replies.",
+    description: "List comments on a file or below a path prefix. Filter by path, pathPrefix, resolved state, or parentId. Defaults to unresolved root comments. Returns { comments } with inline replies.",
     handler: commentList,
-    schema: z.object({
-      path: z.string().optional(),
-      parentId: z.string().optional(),
-      resolved: z.boolean().optional(),
-      orgId: z.string().optional(),
-      limit: z.number().int().min(1).optional(),
-      offset: z.number().int().min(0).optional(),
-    }),
+    schema: z
+      .object({
+        path: z.string().optional(),
+        pathPrefix: z.string().optional(),
+        parentId: z.string().optional(),
+        resolved: z.boolean().optional(),
+        orgId: z.string().optional(),
+        limit: z.number().int().min(1).optional(),
+        offset: z.number().int().min(0).optional(),
+      })
+      .refine(
+        ({ path, pathPrefix }) => path === undefined || pathPrefix === undefined,
+        { message: "path and pathPrefix cannot be used together" }
+      ),
   },
   "comment-get": {
     description: "Get a single comment by ID with all its replies. Returns { comment, replies }.",
@@ -283,11 +335,12 @@ const opRegistry: Record<string, OpDefinition> = {
     }),
   },
   "comment-update": {
-    description: "Update a comment's body. Only the original author can update. Returns { id, body, updatedAt }.",
+    description: "Update a comment's body and optionally replace its mentions. Mentions accept drive-member user IDs or emails. Only the original author can update. Returns { id, body, updatedAt }.",
     handler: commentUpdate,
     schema: z.object({
       id: z.string(),
       body: z.string(),
+      mentions: z.array(z.string().min(1)).max(20).optional(),
     }),
   },
   "comment-delete": {
@@ -306,21 +359,43 @@ const opRegistry: Record<string, OpDefinition> = {
     }),
   },
   "comment-notification-list": {
-    description: "List comment notifications for the current user in the active drive. Returns { notifications, unreadCount }.",
+    description: "List comment or mention notifications for the current user in the active drive. Defaults to comment notifications. Returns { notifications, unreadCount }.",
     handler: commentNotificationList,
     schema: z.object({
       unreadOnly: z.boolean().optional(),
+      kinds: z.array(z.enum(["comment", "mention"])).min(1).optional(),
       limit: z.number().int().min(1).max(100).optional(),
       offset: z.number().int().min(0).optional(),
     }),
   },
   "comment-notification-read": {
-    description: "Mark selected comment notification IDs, or all comment notifications in the active drive, as read. Returns { markedRead }.",
+    description: "Mark selected comment or mention notification IDs, or all notifications of the selected kinds in the active drive, as read. All defaults to comment notifications. Returns { markedRead }.",
     handler: commentNotificationRead,
     schema: z.object({
       ids: z.array(z.string()).min(1).max(100).optional(),
       all: z.literal(true).optional(),
+      kinds: z.array(z.enum(["comment", "mention"])).min(1).optional(),
     }),
+  },
+  "drive-members": {
+    description: "List members of the active drive. Returns { members } with userId, email, and displayName. Membership roles are not included.",
+    handler: driveMembers,
+    schema: z.object({}),
+  },
+  "favorite-add": {
+    description: "Star a file or folder for the current user. Favorites are personal: no other user sees them. Starring twice is a no-op. Moving or renaming a starred file keeps the star; deleting it removes the star, and a folder's star goes away once the folder is gone. Returns { path, kind, createdAt, favorited }.",
+    handler: favoriteAdd,
+    schema: z.object({ path: z.string() }),
+  },
+  "favorite-remove": {
+    description: "Remove the current user's star from a file or folder. Works even when the path no longer exists. Returns { path, removed } where removed is false when there was no star.",
+    handler: favoriteRemove,
+    schema: z.object({ path: z.string() }),
+  },
+  "favorite-list": {
+    description: "List the current user's favorites in the active drive, sorted by path. Returns { favorites } with path, kind (file/directory), and createdAt.",
+    handler: favoriteList,
+    schema: z.object({}),
   },
 };
 
@@ -370,5 +445,5 @@ export function getOpDefinition(name: string): OpDefinition | undefined {
 }
 
 // Re-export individual ops for direct use
-export { write, writeRaw, cat, edit, append, ls, stat, rm, mv, cp, tail, log, diff, revert, recent, grep, fts, search, vecSearch, reindex, tree, glob, sql, signedUrl, commentAdd, commentList, commentGet, commentUpdate, commentDelete, commentResolve, commentNotificationList, commentNotificationRead };
+export { write, writeRaw, cat, edit, append, ls, stat, reveal, rm, mv, cp, tail, log, diff, revert, recent, grep, fts, search, vecSearch, reindex, tree, glob, find, sql, signedUrl, shareCreate, shareRevoke, commentAdd, commentList, commentGet, commentUpdate, commentDelete, commentResolve, commentNotificationList, commentNotificationRead, driveMembers, favoriteAdd, favoriteRemove, favoriteList };
 export type * from "./types.js";

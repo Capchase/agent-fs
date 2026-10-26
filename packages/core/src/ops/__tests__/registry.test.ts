@@ -3,16 +3,18 @@ import { getRegisteredOps, getOpDefinition } from "../index.js";
 
 describe("Op Registry", () => {
   const expectedOps = [
-    "write", "cat", "edit", "append", "ls", "stat", "rm", "mv", "cp",
+    "write", "cat", "edit", "append", "ls", "stat", "reveal", "rm", "mv", "cp",
     "tail", "log", "diff", "revert", "recent",
-    "grep", "fts", "search", "vec-search", "reindex", "tree", "glob", "sql", "signed-url",
+    "grep", "fts", "search", "vec-search", "reindex", "tree", "glob", "find", "sql", "signed-url", "share-create", "share-revoke",
     "comment-add", "comment-list", "comment-get", "comment-update", "comment-delete", "comment-resolve",
     "comment-notification-list", "comment-notification-read",
+    "drive-members",
+    "favorite-add", "favorite-remove", "favorite-list",
   ];
 
-  test("getRegisteredOps returns all 31 ops", () => {
+  test("getRegisteredOps returns all 39 ops", () => {
     const ops = getRegisteredOps();
-    expect(ops.length).toBe(31);
+    expect(ops.length).toBe(39);
     for (const op of expectedOps) {
       expect(ops).toContain(op);
     }

@@ -5,6 +5,10 @@ import type {
   OrgMembersResult,
   RegisterResponse,
   RmResult,
+  FavoriteListResult,
+  PresenceSession,
+  PresenceSnapshot,
+  PresenceState,
   SqlResult,
   SqlTableBinding,
   WriteParams,
@@ -13,6 +17,22 @@ import type {
 
 /** Mirrors the `disposition` param of the core `signed-url` op. */
 export type SignedUrlDisposition = "inline" | "attachment"
+
+/** Result of the core `share-create` op. */
+export interface ShareCreateResult {
+  id: string
+  /** `site` when `path` is a folder. Absent on servers older than site shares. */
+  kind?: "file" | "site"
+  /** Absolute when the server knows its public address, otherwise the same as `sharePath`. */
+  url: string
+  /** Host-relative link: `/share/<token>` for a file, `/site/<token>/` for a folder. */
+  sharePath: string
+  path: string
+  expiresIn: number
+  expiresAt: string
+  /** `null` = unlimited, `1` = one-off. */
+  maxViews: number | null
+}
 
 export interface ApiError {
   error: string
@@ -109,17 +129,25 @@ export class AgentFsClient {
     return this.request<T>(path, opts)
   }
 
-  async post<T>(path: string, body: unknown): Promise<T> {
+  async post<T>(path: string, body: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
     return this.request<T>(path, {
       method: "POST",
       body: JSON.stringify(body),
+      signal: opts?.signal,
     })
   }
 
-  async callOp<T>(orgId: string, op: string, params: Record<string, unknown> = {}, driveId?: string): Promise<T> {
+  /** Pass `opts.signal` to let TanStack Query abort a request whose result nobody reads. */
+  async callOp<T>(
+    orgId: string,
+    op: string,
+    params: Record<string, unknown> = {},
+    driveId?: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<T> {
     const body: Record<string, unknown> = { op, ...params }
     if (driveId) body.driveId = driveId
-    return this.post<T>(`/orgs/${orgId}/ops`, body)
+    return this.post<T>(`/orgs/${orgId}/ops`, body, opts)
   }
 
   async updateProfile(displayName: string | null): Promise<{ userId: string; email: string; displayName: string | null }> {
@@ -151,14 +179,70 @@ export class AgentFsClient {
     orgId: string,
     driveId: string,
     path: string,
-    options?: { disposition?: SignedUrlDisposition },
+    options?: { disposition?: SignedUrlDisposition; signal?: AbortSignal },
   ): Promise<{ url: string; expiresAt: string; expiresIn?: number; kind?: "presigned" | "app" }> {
     return this.callOp<{ url: string; expiresAt: string; expiresIn?: number; kind?: "presigned" | "app" }>(
       orgId,
       "signed-url",
       options?.disposition ? { path, disposition: options.disposition } : { path },
       driveId,
+      { signal: options?.signal },
     )
+  }
+
+  /** Mint a public `/share/<token>` link for `path`. The server defaults to 24 hours. */
+  async createShare(
+    orgId: string,
+    driveId: string,
+    path: string,
+    options?: { expiresIn?: number; maxViews?: number },
+  ): Promise<ShareCreateResult> {
+    return this.callOp<ShareCreateResult>(orgId, "share-create", { path, ...options }, driveId)
+  }
+
+  async listFavorites(orgId: string, driveId: string, opts?: { signal?: AbortSignal }): Promise<FavoriteListResult> {
+    return this.callOp<FavoriteListResult>(orgId, "favorite-list", {}, driveId, opts)
+  }
+
+  /** Star or unstar `path` for the signed-in user. The server takes the user from the API key. */
+  async setFavorite(orgId: string, driveId: string, path: string, favorite: boolean): Promise<void> {
+    await this.callOp(orgId, favorite ? "favorite-add" : "favorite-remove", { path }, driveId)
+  }
+
+  /** Who is on the drive right now (presence fallback when the event stream is unavailable). */
+  async getPresence(orgId: string, driveId: string, opts?: { signal?: AbortSignal }): Promise<PresenceSnapshot> {
+    return this.get<PresenceSnapshot>(`/orgs/${orgId}/drives/${driveId}/presence`, { signal: opts?.signal })
+  }
+
+  /** Publish this tab's presence. The server stamps who it is from the API key. */
+  async putPresence(orgId: string, driveId: string, sessionId: string, state: PresenceState): Promise<{ session: PresenceSession }> {
+    return this.request(`/orgs/${orgId}/drives/${driveId}/presence/${encodeURIComponent(sessionId)}`, {
+      method: "PUT",
+      body: JSON.stringify(state),
+    })
+  }
+
+  /** `keepalive` lets the request outlive the page (sent from `pagehide`). */
+  async deletePresence(orgId: string, driveId: string, sessionId: string, opts?: { keepalive?: boolean }): Promise<void> {
+    await this.request(`/orgs/${orgId}/drives/${driveId}/presence/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+      keepalive: opts?.keepalive,
+    })
+  }
+
+  /**
+   * Open the drive's SSE change-stream with presence frames (`presence=1`),
+   * bound to `sessionId` so the server drops the session when the stream
+   * closes. Returns the raw response: `EventSource` cannot send the Bearer
+   * header, so the caller reads `body` itself.
+   */
+  async openDriveEvents(orgId: string, driveId: string, opts: { sessionId: string; signal?: AbortSignal }): Promise<Response> {
+    const query = new URLSearchParams({ presence: "1", sessionId: opts.sessionId })
+    return fetch(`${this.endpoint}/orgs/${orgId}/drives/${driveId}/events?${query}`, {
+      cache: "no-store",
+      headers: { Accept: "text/event-stream", Authorization: `Bearer ${this.apiKey}` },
+      signal: opts.signal,
+    })
   }
 
   async sqlQuery(
@@ -265,12 +349,45 @@ export class AgentFsClient {
     return `${this.endpoint}/orgs/${orgId}/drives/${driveId}/files/${encodeURIComponent(path)}/raw`
   }
 
-  async fetchRaw(orgId: string, driveId: string, path: string): Promise<Blob> {
+  /**
+   * The raw route answers with `max-age=60`; reads default to `no-store` so an
+   * edited file is never served from the browser cache.
+   */
+  async fetchRawResponse(
+    orgId: string,
+    driveId: string,
+    path: string,
+    init?: Omit<RequestInit, "headers">,
+  ): Promise<Response> {
     const url = this.getRawUrl(orgId, driveId, path)
     const res = await fetch(url, {
+      cache: "no-store",
+      ...init,
       headers: { Authorization: `Bearer ${this.apiKey}` },
     })
     if (!res.ok) throw new Error(`Failed to fetch raw: ${res.statusText}`)
-    return res.blob()
+    return res
+  }
+
+  async fetchRaw(orgId: string, driveId: string, path: string, init?: Omit<RequestInit, "headers">): Promise<Blob> {
+    return (await this.fetchRawResponse(orgId, driveId, path, init)).blob()
+  }
+
+  /**
+   * A URL the browser can load for `path`. Backends without presigned URLs
+   * answer `signed-url` with an `app` link, which is the viewer page rather
+   * than the bytes; those are read through the authenticated raw route into
+   * an object URL that the caller must revoke.
+   */
+  async fetchableUrl(
+    orgId: string,
+    driveId: string,
+    path: string,
+    options?: { disposition?: SignedUrlDisposition; signal?: AbortSignal },
+  ): Promise<{ url: string; expiresAt: string; objectUrl: boolean }> {
+    const result = await this.getSignedUrl(orgId, driveId, path, options)
+    if (result.kind !== "app") return { url: result.url, expiresAt: result.expiresAt, objectUrl: false }
+    const blob = await this.fetchRaw(orgId, driveId, path, { signal: options?.signal })
+    return { url: URL.createObjectURL(blob), expiresAt: "", objectUrl: true }
   }
 }

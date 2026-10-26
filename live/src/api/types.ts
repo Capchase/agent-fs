@@ -42,6 +42,15 @@ export interface StatResult {
   modifiedAt: string
   isDeleted: boolean
   embeddingStatus?: string
+  /** Storage ETag of the current bytes (newer servers only). Opaque. */
+  etag?: string
+}
+
+/** Result of the `reveal` op: every ancestor's `ls` listing, root first. */
+export interface RevealResult {
+  path: string
+  stat: StatResult
+  listings: { path: string; entries: LsEntry[] }[]
 }
 
 export interface VersionEntry {
@@ -62,10 +71,25 @@ export interface DiffChange {
   type: "add" | "remove" | "context"
   content: string
   lineNumber?: number
+  /** 1-based line in v1; absent on servers that predate line numbers. */
+  oldLine?: number
+  /** 1-based line in v2; absent on servers that predate line numbers. */
+  newLine?: number
 }
+
+/**
+ * Which path produced a DiffResult:
+ * - "content": both versions were compared line by line.
+ * - "summary": not compared; `changes` is v2's stored edit snippet.
+ * - "none": not compared and no stored summary; empty `changes` does NOT mean
+ *   the versions are identical.
+ */
+export type DiffSource = "content" | "summary" | "none"
 
 export interface DiffResult {
   changes: DiffChange[]
+  /** Absent on servers that predate it; never read its absence as "content". */
+  source?: DiffSource
 }
 
 export interface RecentEntry extends VersionEntry {
@@ -86,7 +110,27 @@ export interface GlobResult {
   matches: GlobMatch[]
 }
 
+export interface FindMatch {
+  path: string
+  size: number
+  modifiedAt?: string
+  score: number
+}
+
+export interface FindResult {
+  /** Best first, capped at the request's `limit`. */
+  matches: FindMatch[]
+  /** Number of matching files before the cap. */
+  total: number
+}
+
 // Comment types
+
+export interface CommentQuote {
+  exact: string
+  prefix?: string
+  suffix?: string
+}
 
 export interface CommentEntry {
   id: string
@@ -95,6 +139,7 @@ export interface CommentEntry {
   lineStart?: number
   lineEnd?: number
   quotedContent?: string
+  quote?: CommentQuote
   body: string
   author: string
   authorDisplayName?: string
@@ -102,6 +147,8 @@ export interface CommentEntry {
   resolvedBy?: string
   resolvedAt?: string
   fileVersionId?: number
+  /** Version number of fileVersionId; absent on older servers. */
+  fileVersion?: number
   replyCount: number
   createdAt: string
   updatedAt: string
@@ -156,6 +203,7 @@ export interface CommentNotificationEntry {
   path: string
   body: string
   actor: string
+  actorDisplayName?: string
   createdAt: string
   read: boolean
 }
@@ -180,6 +228,8 @@ export interface FtsOpMatch {
 export interface FtsResult {
   matches: FtsOpMatch[]
   hint?: string
+  /** Server time for the query, in milliseconds (servers from 0.16.8). */
+  tookMs?: number
 }
 
 // Search types (from core/ops/search.ts)
@@ -188,6 +238,10 @@ export interface SearchResultItem {
   path: string
   score: number
   snippet: string
+  /** What the best semantic chunk holds (servers from 0.17.4). */
+  kind?: "text" | "image"
+  /** PDF page of the best semantic chunk (servers from 0.17.3). */
+  page?: number
   author?: string
   modifiedAt?: string
 }
@@ -195,6 +249,8 @@ export interface SearchResultItem {
 export interface SearchResult {
   results: SearchResultItem[]
   hint?: string
+  /** Server time for the search, in milliseconds (servers from 0.16.8). */
+  tookMs?: number
 }
 
 // Grep types (from core/ops/grep.ts)
@@ -273,6 +329,16 @@ export interface OrgMembersResult {
   members: OrgMember[]
 }
 
+export interface DriveMember {
+  userId: string
+  email: string
+  displayName: string | null
+}
+
+export interface DriveMembersResult {
+  members: DriveMember[]
+}
+
 export interface MeResponse {
   displayName?: string | null
   userId: string
@@ -310,3 +376,71 @@ export interface RmResult {
   path: string
   deleted: boolean
 }
+
+export interface Favorite {
+  /** Server form: leading slash, no trailing slash. */
+  path: string
+  kind: "file" | "directory"
+  createdAt: string
+}
+
+export interface FavoriteListResult {
+  favorites: Favorite[]
+}
+
+// Presence (live UI only). Mirrors packages/core/src/presence/types.ts.
+
+export interface PresenceQuote {
+  /** At most 256 chars. */
+  exact: string
+  /** At most 64 chars each. */
+  prefix?: string
+  suffix?: string
+}
+
+/** A text selection, or the text caret when `collapsed`. */
+export interface PresenceSelection {
+  quote: PresenceQuote
+  lineStart: number
+  lineEnd: number
+  fileVersion?: number | null
+  collapsed: boolean
+}
+
+/** A point in the text (the mouse pointer): `charOffset` chars into the quote. */
+export interface PresenceTextPos {
+  quote: PresenceQuote
+  charOffset: number
+  lineStart: number
+  fileVersion?: number | null
+}
+
+/** Body of `PUT .../presence/:sessionId`. */
+export interface PresenceState {
+  /** null = on the drive, no doc open. */
+  path: string | null
+  mode: "view" | "edit"
+  selection?: PresenceSelection | null
+  pointer?: PresenceTextPos | null
+  commentId?: string | null
+  commentState?: "viewing" | "replying" | null
+}
+
+export interface PresenceSession extends PresenceState {
+  sessionId: string
+  userId: string
+  email: string
+  displayName: string | null
+  /** ISO time of the last state change. */
+  updatedAt: string
+}
+
+export interface PresenceSnapshot {
+  driveId: string
+  sessions: PresenceSession[]
+  at: string
+}
+
+export type PresenceEvent =
+  | { type: "presence.updated"; driveId: string; session: PresenceSession; at: string }
+  | { type: "presence.left"; driveId: string; sessionId: string; userId: string; at: string }

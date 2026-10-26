@@ -12,6 +12,8 @@ import { ValidationError } from "../errors.js";
 import { requireDriveRole } from "../identity/rbac.js";
 import { recordOp } from "../telemetry.js";
 import { indexBytesForSearch, indexTextForSearch } from "./search-index.js";
+import { normalizePath } from "./paths.js";
+import { findMissingLinkTargets } from "./md-links.js";
 
 /** Max file size: 10 MB. Protects SQLite FTS indexing and embedding costs. */
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -31,8 +33,7 @@ export async function write(
 /**
  * Internal binary write path used by `PUT /raw` and the FUSE mount. Accepts
  * up to AGENT_FS_MAX_UPLOAD_BYTES (default 50 MiB), unlike the JSON 10 MiB cap. Bytes
- * are stored unchanged; search indexing runs only when the payload is valid,
- * indexable UTF-8 text.
+ * are stored unchanged. Search indexes UTF-8 text and extracted PDF text.
  *
  * RBAC: callers reach this directly (not via `dispatchOp`), so the
  * editor-or-better requirement that `dispatchOp` enforces for the JSON
@@ -58,7 +59,8 @@ async function writeInternal(
   params: WriteRawParams & { indexableText?: string },
   opts: { maxSize: number }
 ): Promise<WriteResult> {
-  const s3Key = getS3Key(ctx.orgId, ctx.driveId, params.path);
+  const path = normalizePath(params.path);
+  const s3Key = getS3Key(ctx.orgId, ctx.driveId, path);
   const bytes = params.bytes;
   const size = bytes.byteLength;
 
@@ -81,7 +83,7 @@ async function writeInternal(
   if (params.expectedVersion !== undefined) {
     const currentVersion = await assertExpectedVersion(
       ctx,
-      params.path,
+      path,
       params.expectedVersion
     );
 
@@ -90,26 +92,26 @@ async function writeInternal(
     // The server is the source of truth for hash, so this safely handles
     // FUSE-driven `touch`/idempotent-rewrite traffic.
     if (currentVersion > 0) {
-      const headHash = await getHeadContentHash(ctx, params.path);
+      const headHash = await getHeadContentHash(ctx, path);
       if (headHash !== null && headHash === contentHash) {
-        return {
+        return withLinkWarnings(ctx, params, {
           version: currentVersion,
-          path: params.path,
+          path,
           size,
           contentHash,
           deduped: true,
-        };
+        });
       }
     }
   }
 
   // 1. Write to S3
-  const contentType = detectMimeType(params.path);
+  const contentType = detectMimeType(path);
   const s3Result = await ctx.s3.putObject(s3Key, bytes, undefined, contentType);
 
   // 2. Create version record
   const version = await createVersion(ctx, {
-    path: params.path,
+    path,
     s3VersionId: s3Result.versionId ?? "",
     operation: "write",
     message: params.message,
@@ -120,10 +122,33 @@ async function writeInternal(
   });
 
   if (params.indexableText !== undefined) {
-    indexTextForSearch(ctx, params.path, params.indexableText);
+    await indexTextForSearch(ctx, path, params.indexableText);
   } else {
-    indexBytesForSearch(ctx, params.path, bytes, contentType);
+    await indexBytesForSearch(ctx, path, bytes, contentType);
   }
 
-  return { version, path: params.path, size, contentHash, deduped: false };
+  return withLinkWarnings(ctx, params, { version, path, size, contentHash, deduped: false });
+}
+
+/**
+ * Adds `warnings` for markdown links whose target is missing from the drive.
+ * Runs after the write so a link to the file itself resolves. The field is
+ * omitted when there is nothing to report.
+ */
+function withLinkWarnings(
+  ctx: OpContext,
+  params: WriteRawParams & { indexableText?: string },
+  result: WriteResult
+): WriteResult {
+  if (detectMimeType(result.path) !== "text/markdown") return result;
+  let text = params.indexableText;
+  if (text === undefined) {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(params.bytes);
+    } catch {
+      return result;
+    }
+  }
+  const warnings = findMissingLinkTargets(ctx, result.path, text);
+  return warnings.length > 0 ? { ...result, warnings } : result;
 }

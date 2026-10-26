@@ -1,6 +1,7 @@
-import { useState } from "react"
-import { Check, Trash2, Pencil, MessageSquare, RotateCcw, X, ChevronDown, ChevronRight } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
+import { Check, Trash2, Pencil, MessageSquare, RotateCcw, X, ChevronDown, ChevronRight, TriangleAlert } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { scrollBehavior } from "@/lib/outline"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -9,8 +10,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { useResolveComment, useDeleteComment, useUpdateComment } from "@/hooks/use-comments"
-import { UserName, useDisplayName } from "@/components/UserName"
+import { UserName } from "@/components/UserName"
+import { UserAvatar } from "@/components/UserAvatar"
+import { CommentReplying, CommentViewers } from "@/components/presence/CommentPresence"
 import { AddComment } from "./AddComment"
+import { commentAnchors, useActiveComment, useCommentAnchor, useFocusedComment, useHoveredComment } from "@/stores/comment-anchors"
+import { presenceStore } from "@/stores/presence"
 import type { CommentListEntry, CommentEntry } from "@/api/types"
 
 function timeAgo(dateStr: string): string {
@@ -24,31 +29,11 @@ function timeAgo(dateStr: string): string {
   return `${days}d ago`
 }
 
-function avatarColor(id: string): string {
-  let hash = 0
-  for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash)
-  const hue = Math.abs(hash) % 360
-  return `oklch(0.65 0.15 ${hue})`
-}
-
-function Avatar({ userId, displayName }: { userId: string; displayName?: string }) {
-  const { display } = useDisplayName(userId, displayName)
-  const initial = display.charAt(0).toUpperCase()
-  return (
-    <div
-      className="flex size-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium text-white"
-      style={{ backgroundColor: avatarColor(userId) }}
-    >
-      {initial}
-    </div>
-  )
-}
-
 interface CommentThreadProps {
   comment: CommentListEntry
   path: string
   currentUserId?: string
-  onCommentClick?: (lineStart?: number, lineEnd?: number, quotedContent?: string) => void
+  onCommentClick?: (lineStart?: number, lineEnd?: number, quotedContent?: string, commentId?: string) => void
 }
 
 export function CommentThread({ comment, path, currentUserId, onCommentClick }: CommentThreadProps) {
@@ -63,37 +48,109 @@ export function CommentThread({ comment, path, currentUserId, onCommentClick }: 
   const updateComment = useUpdateComment()
 
   const isOwn = currentUserId === comment.author
-  const isGeneralComment = !comment.lineStart
+  const quoteText = comment.quotedContent ?? comment.quote?.exact
+  const isGeneralComment = !comment.lineStart && !quoteText
   const hasReplies = comment.replies.length > 0
+
+  // Resolved anchor (published by the open viewer) and cross-hover state.
+  const anchor = useCommentAnchor(comment.id)
+  const hovered = useHoveredComment()
+  const docHovered = hovered?.id === comment.id && hovered.source === "doc"
+  const focused = useFocusedComment()
+  const active = useActiveComment() === comment.id
+  const cardRef = useRef<HTMLDivElement>(null)
+  const lineStart = anchor?.lineStart ?? comment.lineStart
+  const lineEnd = anchor?.lineStart != null ? anchor.lineEnd : comment.lineEnd
+
+  // A highlight click in the document asked to reveal this card. Only a visible
+  // card consumes the request: on mobile the desktop rail stays mounted but
+  // hidden, and the request must wait for the sheet's card.
+  useEffect(() => {
+    const el = cardRef.current
+    if (focused !== comment.id || !el?.offsetParent) return
+    commentAnchors.setFocused(null)
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "center" })
+    el.classList.remove("comment-card-pulse")
+    void el.offsetWidth // restart the animation
+    el.classList.add("comment-card-pulse")
+  }, [focused, comment.id])
+
+  // Presence: while the reply box is open and focused, others see "replying".
+  // Closing the box (or the thread going away) ends it even without a blur.
+  useEffect(() => {
+    if (!replying) return
+    return () => presenceStore.endCommentActivity("reply", comment.id)
+  }, [replying, comment.id])
+  useEffect(() => () => presenceStore.endCommentActivity("focus", comment.id), [comment.id])
 
   const handleThreadClick = () => {
     if (onCommentClick) {
-      onCommentClick(comment.lineStart, comment.lineEnd ?? comment.lineStart, comment.quotedContent)
+      onCommentClick(comment.lineStart, comment.lineEnd ?? comment.lineStart, comment.quotedContent, comment.id)
     }
   }
 
   return (
-    <div className={cn("border-b border-border last:border-b-0", comment.resolved && "opacity-60")}>
+    <div
+      className={cn("border-b border-border last:border-b-0", comment.resolved && "opacity-60")}
+      // Presence: keyboard focus anywhere in the thread counts as viewing it.
+      onFocus={() => presenceStore.setCommentActivity("focus", comment.id)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) presenceStore.endCommentActivity("focus", comment.id)
+      }}
+    >
       <div
-        className={cn("px-3 py-2.5", (comment.lineStart || comment.quotedContent) && "cursor-pointer hover:bg-accent/50 transition-colors")}
+        ref={cardRef}
+        className={cn(
+          "px-3 py-2.5",
+          !isGeneralComment && "cursor-pointer hover:bg-accent/50 transition-colors",
+          docHovered && "comment-card-pulse bg-accent/50",
+          active && "comment-card-active",
+        )}
         onClick={handleThreadClick}
+        onMouseEnter={isGeneralComment ? undefined : () => commentAnchors.setHovered(comment.id, "card")}
+        onMouseLeave={isGeneralComment ? undefined : () => commentAnchors.setHovered(null, "card")}
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-1">
           <div className="flex items-center gap-1.5 min-w-0">
-            <Avatar userId={comment.author} displayName={comment.authorDisplayName} />
+            <UserAvatar userId={comment.author} displayName={comment.authorDisplayName} />
             <UserName userId={comment.author} displayName={comment.authorDisplayName} />
             <span className="text-[11px] text-muted-foreground shrink-0">{timeAgo(comment.createdAt)}</span>
             {isGeneralComment && (
               <span className="text-[10px] text-muted-foreground/60 shrink-0">general</span>
             )}
-            {comment.lineStart && (
+            {lineStart && anchor?.status !== "lost" && (
               <span className="text-[10px] font-mono text-amber-600 dark:text-amber-400 shrink-0">
-                L{comment.lineStart}{comment.lineEnd && comment.lineEnd !== comment.lineStart ? `-${comment.lineEnd}` : ""}
+                L{lineStart}{lineEnd && lineEnd !== lineStart ? `-${lineEnd}` : ""}
               </span>
+            )}
+            {anchor && anchor.status !== "anchored" && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-0.5 rounded px-1 text-[10px] shrink-0",
+                        anchor.status === "moved"
+                          ? "bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                          : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      <TriangleAlert className="size-2.5" />
+                      {anchor.status === "moved" ? "moved" : "anchor lost"}
+                    </span>
+                  }
+                />
+                <TooltipContent>
+                  {anchor.status === "moved"
+                    ? "The text changed since this comment. Showing its closest match."
+                    : "The text this comment pointed to is no longer in the file."}
+                </TooltipContent>
+              </Tooltip>
             )}
           </div>
           <div className="flex items-center gap-0.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <CommentViewers path={path} commentId={comment.id} />
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -142,9 +199,9 @@ export function CommentThread({ comment, path, currentUserId, onCommentClick }: 
         </div>
 
         {/* Quoted content */}
-        {comment.quotedContent && (
+        {quoteText && (
           <div className="mb-1.5 ml-6.5 rounded border-l-2 border-amber-400/50 bg-amber-500/5 px-2 py-1 text-xs font-mono text-muted-foreground">
-            <span className="line-clamp-2">{comment.quotedContent}</span>
+            <span className={cn("line-clamp-2", anchor?.status === "lost" && "line-through decoration-muted-foreground/50")}>{quoteText}</span>
           </div>
         )}
 
@@ -181,6 +238,7 @@ export function CommentThread({ comment, path, currentUserId, onCommentClick }: 
               Reply
             </button>
           </div>
+          <CommentReplying path={path} commentId={comment.id} />
         </div>
       </div>
 
@@ -195,7 +253,14 @@ export function CommentThread({ comment, path, currentUserId, onCommentClick }: 
 
       {/* Reply form */}
       {replying && (
-        <div className="border-t border-border px-3 py-2.5 bg-muted/30" onClick={(e) => e.stopPropagation()}>
+        <div
+          className="border-t border-border px-3 py-2.5 bg-muted/30"
+          onClick={(e) => e.stopPropagation()}
+          onFocus={() => presenceStore.setCommentActivity("reply", comment.id)}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) presenceStore.endCommentActivity("reply", comment.id)
+          }}
+        >
           <AddComment
             path={path}
             parentId={comment.id}
@@ -239,7 +304,7 @@ function ReplyItem({ reply, path, currentUserId }: { reply: CommentEntry; path: 
     <div className="border-b border-border last:border-b-0 px-3 py-2">
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-1.5 min-w-0">
-          <Avatar userId={reply.author} displayName={reply.authorDisplayName} />
+          <UserAvatar userId={reply.author} displayName={reply.authorDisplayName} />
           <UserName userId={reply.author} displayName={reply.authorDisplayName} />
           <span className="text-[11px] text-muted-foreground shrink-0">{timeAgo(reply.createdAt)}</span>
         </div>

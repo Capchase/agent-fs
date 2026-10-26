@@ -7,6 +7,9 @@ import { UserName } from "@/components/UserName"
 import { MainWithComments } from "@/components/layout/MainWithComments"
 import { Button } from "@/components/ui/button"
 import { Kbd } from "@/components/ui/kbd"
+import { ShareButton } from "@/components/ShareDialog"
+import { FileFavoriteButton } from "@/components/FavoriteToggle"
+import { PresenceAvatars } from "@/components/presence/PresenceAvatars"
 import {
   Tooltip,
   TooltipContent,
@@ -30,7 +33,7 @@ export function FileDetailPage() {
 
   const filePath = params["*"] ?? ""
   const { data: stat } = useFileStat(filePath || null)
-  const { copyPath, copyLink, download, copiedPath, copiedLink, canShare } = useFileActions(filePath)
+  const { copyPath, copyLink, download, copiedPath, copiedLink, canShare, canShareLink } = useFileActions(filePath)
 
   // Tab title reflects the open file (single-sourced via the shared hook).
   useDocumentTitle(filePath ? (filePath.split("/").pop() ?? filePath) : null)
@@ -46,8 +49,8 @@ export function FileDetailPage() {
     queueMicrotask(() => uiChromeStore.setLeft(false))
   }, [])
 
-  const handleCommentClick = useCallback((lineStart?: number, _lineEnd?: number, quotedContent?: string) => {
-    scrollToCommentRef.current?.({ lineStart, quotedContent })
+  const handleCommentClick = useCallback((lineStart?: number, _lineEnd?: number, quotedContent?: string, commentId?: string) => {
+    scrollToCommentRef.current?.({ lineStart, quotedContent, commentId })
   }, [])
 
   if (!filePath) {
@@ -70,10 +73,12 @@ export function FileDetailPage() {
                 {formatBytes(stat.size)} &middot;{" "}
                 <UserName userId={stat.author} className="text-xs text-muted-foreground" />
                 {" "}&middot; {new Date(stat.modifiedAt).toLocaleDateString()}
+                {stat.embeddingStatus && <> &middot; Embedding: {stat.embeddingStatus}</>}
               </span>
             )}
           </div>
           <div className="flex items-center gap-1 px-2 shrink-0">
+            <PresenceAvatars path={filePath} />
             {isQueryablePath(filePath) && orgId && driveId && (
               <Tooltip>
                 <TooltipTrigger
@@ -94,6 +99,7 @@ export function FileDetailPage() {
                 <TooltipContent>Query with SQL</TooltipContent>
               </Tooltip>
             )}
+            <FileFavoriteButton path={filePath} />
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -128,6 +134,7 @@ export function FileDetailPage() {
                 <TooltipContent>Copy link <Kbd className="ml-1">⇧Y</Kbd></TooltipContent>
               </Tooltip>
             )}
+            {canShareLink && <ShareButton path={filePath} />}
             <Tooltip>
               <TooltipTrigger
                 render={

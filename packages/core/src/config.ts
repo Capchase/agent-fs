@@ -10,6 +10,18 @@ export function getMaxUploadBytes(): number {
   return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : DEFAULT_MAX_UPLOAD_BYTES;
 }
 
+/** Env-only UTF-8 text limit. Invalid or unset values leave embedding uncapped. */
+export function getEmbeddingMaxBytes(): number | undefined {
+  const raw = process.env.AGENT_FS_EMBEDDING_MAX_BYTES?.trim();
+  const bytes = raw && /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
+}
+
+export function getEmbeddingExcludeDrives(): string[] {
+  return [...new Set((process.env.AGENT_FS_EMBEDDING_EXCLUDE_DRIVES ?? "")
+    .split(",").map((id) => id.trim()).filter(Boolean))].sort();
+}
+
 function resolveHome(): string {
   const home = process.env.AGENT_FS_HOME ?? join(process.env.HOME ?? "/tmp", ".agent-fs");
   // Expand ~ since env vars loaded by bun/.env don't do shell expansion
@@ -73,7 +85,7 @@ export interface AgentFSConfig {
    */
   s3: AgentFSStorageConfig;
   embedding: {
-    provider: "local" | "openai" | "gemini";
+    provider: "local" | "openai" | "gemini" | "openrouter";
     model: string;
     apiKey: string;
   };
@@ -88,6 +100,24 @@ export interface AgentFSConfig {
     rateLimit?: {
       requestsPerMinute: number;
     };
+    /** Per-key limit for presence routes (default 1200). */
+    presenceRateLimit?: {
+      requestsPerMinute: number;
+    };
+    /** Per-IP limit for the public /share/:token routes (default 120). */
+    shareRateLimit?: {
+      requestsPerMinute: number;
+    };
+    /** Per-IP limit for the public /site/:token routes (default 600: one page load fetches many files). */
+    siteRateLimit?: {
+      requestsPerMinute: number;
+    };
+    /**
+     * Public address of this API server, e.g. https://agent-fs-acme.fly.dev.
+     * Used to build absolute share links; when unset it is derived from the
+     * request's Host / X-Forwarded-* headers.
+     */
+    publicUrl?: string;
   };
   auth: {
     apiKey: string;
@@ -128,7 +158,7 @@ const DEFAULT_CONFIG: AgentFSConfig = {
       origins: ["*"],
     },
     rateLimit: {
-      requestsPerMinute: 1200,
+      requestsPerMinute: 3000,
     },
   },
   auth: {
@@ -167,7 +197,7 @@ function deepMergeConfig(
   defaults: AgentFSConfig,
   overrides: Partial<AgentFSConfig>
 ): AgentFSConfig {
-  const result = { ...defaults };
+  const result = structuredClone(defaults);
   for (const key of Object.keys(overrides) as (keyof AgentFSConfig)[]) {
     const ov = overrides[key];
     // Storage is a tagged union. The only genuine *shape* switch is to/from the
@@ -185,14 +215,14 @@ function deepMergeConfig(
         result.s3 = { ...(ovS3 as AgentFSStorageConfig) };
       } else {
         result.s3 = {
-          ...(defaults.s3 as object),
+          ...(result.s3 as object),
           ...(ovS3 as object),
         } as AgentFSStorageConfig;
       }
       continue;
     }
     if (ov && typeof ov === "object" && !Array.isArray(ov)) {
-      result[key] = { ...(defaults[key] as any), ...(ov as any) } as any;
+      result[key] = { ...(result[key] as any), ...(ov as any) } as any;
     } else if (ov !== undefined) {
       result[key] = ov as any;
     }
@@ -259,8 +289,13 @@ function applyEnvOverrides(config: AgentFSConfig): AgentFSConfig {
     config.server.host = (env.SERVER_HOST || env.HOST)!;
 
   // Embedding overrides
-  if (env.EMBEDDING_PROVIDER)
-    config.embedding.provider = env.EMBEDDING_PROVIDER as "local" | "openai" | "gemini";
+  if (env.EMBEDDING_PROVIDER) {
+    if (env.EMBEDDING_PROVIDER !== config.embedding.provider) {
+      config.embedding.model = "";
+      config.embedding.apiKey = "";
+    }
+    config.embedding.provider = env.EMBEDDING_PROVIDER as AgentFSConfig["embedding"]["provider"];
+  }
   if (env.EMBEDDING_MODEL) config.embedding.model = env.EMBEDDING_MODEL;
   if (env.EMBEDDING_API_KEY) config.embedding.apiKey = env.EMBEDDING_API_KEY;
 
@@ -268,9 +303,25 @@ function applyEnvOverrides(config: AgentFSConfig): AgentFSConfig {
 
   // Rate limit override
   if (env.AGENT_FS_RATE_LIMIT) {
-    if (!config.server.rateLimit) config.server.rateLimit = { requestsPerMinute: 1200 };
+    if (!config.server.rateLimit) config.server.rateLimit = { requestsPerMinute: 3000 };
     config.server.rateLimit.requestsPerMinute = parseInt(env.AGENT_FS_RATE_LIMIT, 10);
   }
+
+  if (env.AGENT_FS_PRESENCE_RATE_LIMIT) {
+    const rpm = parseInt(env.AGENT_FS_PRESENCE_RATE_LIMIT, 10);
+    if (Number.isFinite(rpm) && rpm >= 0) config.server.presenceRateLimit = { requestsPerMinute: rpm };
+  }
+
+  // Share-link overrides
+  if (env.AGENT_FS_SHARE_RATE_LIMIT) {
+    const rpm = parseInt(env.AGENT_FS_SHARE_RATE_LIMIT, 10);
+    if (Number.isFinite(rpm) && rpm >= 0) config.server.shareRateLimit = { requestsPerMinute: rpm };
+  }
+  if (env.AGENT_FS_SITE_RATE_LIMIT) {
+    const rpm = parseInt(env.AGENT_FS_SITE_RATE_LIMIT, 10);
+    if (Number.isFinite(rpm) && rpm >= 0) config.server.siteRateLimit = { requestsPerMinute: rpm };
+  }
+  if (env.AGENT_FS_PUBLIC_URL) config.server.publicUrl = env.AGENT_FS_PUBLIC_URL;
 
   // App URL override
   if (env.AGENT_FS_APP_URL) config.appUrl = env.AGENT_FS_APP_URL;
@@ -278,17 +329,21 @@ function applyEnvOverrides(config: AgentFSConfig): AgentFSConfig {
   return config;
 }
 
-export function getConfig(): AgentFSConfig {
+function readConfigFile(): Partial<AgentFSConfig> {
   ensureHomeDir();
   const configPath = getConfigPath();
 
   if (!existsSync(configPath)) {
     writeFileSync(configPath, JSON.stringify(DEFAULT_CONFIG, null, 2));
-    return applyEnvOverrides(structuredClone(DEFAULT_CONFIG));
+    return structuredClone(DEFAULT_CONFIG);
   }
 
   const raw = readFileSync(configPath, "utf-8");
-  const parsed = JSON.parse(raw) as Partial<AgentFSConfig>;
+  return JSON.parse(raw) as Partial<AgentFSConfig>;
+}
+
+export function getConfig(): AgentFSConfig {
+  const parsed = readConfigFile();
   return applyEnvOverrides(deepMergeConfig(DEFAULT_CONFIG, parsed));
 }
 
@@ -296,13 +351,20 @@ export function setConfig<K extends keyof AgentFSConfig>(
   key: K,
   value: AgentFSConfig[K]
 ): void {
-  const config = getConfig();
+  const config = deepMergeConfig(DEFAULT_CONFIG, readConfigFile());
   config[key] = value;
   writeFileSync(getConfigPath(), JSON.stringify(config, null, 2));
 }
 
-export function setConfigValue(path: string, value: unknown): void {
-  const config = getConfig();
+export function setConfigValue(path: string, value: unknown): boolean {
+  const parsed = readConfigFile();
+  const config = deepMergeConfig(DEFAULT_CONFIG, parsed);
+  const providerChanged = path === "embedding.provider" && value !== config.embedding.provider;
+  const removedProviderFields = providerChanged && !!(config.embedding.model || config.embedding.apiKey);
+  if (providerChanged) {
+    config.embedding.model = "";
+    config.embedding.apiKey = "";
+  }
   const keys = path.split(".");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let obj: any = config;
@@ -311,4 +373,5 @@ export function setConfigValue(path: string, value: unknown): void {
   }
   obj[keys[keys.length - 1]] = value;
   writeFileSync(getConfigPath(), JSON.stringify(config, null, 2));
+  return removedProviderFields;
 }

@@ -1,6 +1,8 @@
 // Raw SQL for table creation and virtual tables.
 // These are idempotent (IF NOT EXISTS) and run on every DB init.
 
+export const EMBEDDING_STATUS_COLUMN_SQL = "embedding_status TEXT DEFAULT 'pending' CHECK(embedding_status IN ('pending', 'indexed', 'failed', 'skipped'))";
+
 export const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -9,6 +11,8 @@ CREATE TABLE IF NOT EXISTS users (
   api_key_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_users_api_key_hash ON users(api_key_hash);
 
 CREATE TABLE IF NOT EXISTS orgs (
   id TEXT PRIMARY KEY,
@@ -49,9 +53,13 @@ CREATE TABLE IF NOT EXISTS files (
   created_at INTEGER NOT NULL,
   modified_at INTEGER NOT NULL,
   is_deleted INTEGER NOT NULL DEFAULT 0,
-  embedding_status TEXT DEFAULT 'pending' CHECK(embedding_status IN ('pending', 'indexed', 'failed')),
+  ${EMBEDDING_STATUS_COLUMN_SQL},
+  image_embedding_status TEXT CHECK(image_embedding_status IN ('pending', 'indexed', 'failed')),
   PRIMARY KEY (path, drive_id)
 );
+
+-- Support drive-scoped file listings and prefix scans.
+CREATE INDEX IF NOT EXISTS idx_files_drive_path ON files(drive_id, path);
 
 CREATE TABLE IF NOT EXISTS file_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +89,9 @@ CREATE TABLE IF NOT EXISTS comments (
   line_start INTEGER,
   line_end INTEGER,
   quoted_content TEXT,
+  quote_exact TEXT,
+  quote_prefix TEXT,
+  quote_suffix TEXT,
   file_version_id INTEGER REFERENCES file_versions(id),
   body TEXT NOT NULL,
   author TEXT NOT NULL REFERENCES users(id),
@@ -95,6 +106,14 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE INDEX IF NOT EXISTS idx_comments_path ON comments(drive_id, path);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_org ON comments(org_id);
+
+CREATE TABLE IF NOT EXISTS comment_mentions (
+  comment_id TEXT NOT NULL REFERENCES comments(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (comment_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comment_mentions_user ON comment_mentions(user_id);
 
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
@@ -114,6 +133,59 @@ CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor);
 CREATE INDEX IF NOT EXISTS idx_events_notification_inbox
   ON events(org_id, type, target, status, created_at DESC);
 
+-- Public share links (/share/:token). Only the SHA-256 of the token is
+-- stored, so a database read cannot be turned back into a working link. There
+-- are deliberately no foreign keys: a share must never block deleting a user,
+-- drive or org, and a dangling share just resolves to "file unavailable".
+CREATE TABLE IF NOT EXISTS shares (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'file',
+  token_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  max_views INTEGER,
+  views INTEGER NOT NULL DEFAULT 0,
+  last_viewed_at INTEGER,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS shares_token_hash_uq ON shares(token_hash);
+CREATE INDEX IF NOT EXISTS idx_shares_drive_path ON shares(drive_id, path);
+
+-- What a counted page view of a view-limited share gets to fetch its bytes
+-- with. Only the SHA-256 of the grant is stored. Bytes of a view-limited link
+-- are never served on the (spent) share token alone.
+CREATE TABLE IF NOT EXISTS share_view_grants (
+  grant_hash TEXT PRIMARY KEY,
+  share_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_share_view_grants_share ON share_view_grants(share_id);
+CREATE INDEX IF NOT EXISTS idx_share_view_grants_expiry ON share_view_grants(expires_at);
+
+-- Per-user favorites (stars). Keyed by (user, drive, path), so one user's
+-- stars never show up for another. kind is what the path named when it was
+-- starred. No foreign keys, same reasoning as shares: a star must never block
+-- deleting a user or drive. rm and mv keep rows in step with the files they
+-- name (see ops/favorite.ts).
+CREATE TABLE IF NOT EXISTS favorites (
+  user_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('file', 'directory')),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, drive_id, path)
+);
+
+-- rm and mv find every user's star on a path through this.
+CREATE INDEX IF NOT EXISTS idx_favorites_drive_path ON favorites(drive_id, path);
+
 CREATE TABLE IF NOT EXISTS content_chunks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_path TEXT NOT NULL,
@@ -121,7 +193,9 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   chunk_index INTEGER NOT NULL,
   content TEXT NOT NULL,
   char_offset INTEGER NOT NULL,
-  token_count INTEGER NOT NULL
+  token_count INTEGER NOT NULL,
+  page INTEGER,
+  kind TEXT NOT NULL DEFAULT 'text'
 );
 
 -- Every write, rm, mv and the embedding job look chunks up by (drive, path).

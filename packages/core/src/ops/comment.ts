@@ -1,4 +1,4 @@
-import { eq, and, sql, desc, ne, inArray } from "drizzle-orm";
+import { eq, and, sql, desc, ne, inArray, notInArray } from "drizzle-orm";
 import { schema } from "../db/index.js";
 import type {
   OpContext,
@@ -16,8 +16,20 @@ import type {
   CommentResolveParams,
   CommentResolveResult,
   CommentEntry,
+  CommentQuote,
 } from "./types.js";
 import { NotFoundError, ValidationError, PermissionDeniedError } from "../errors.js";
+import { normalizePath, normalizePrefix } from "./paths.js";
+import { publishDriveEvent, type DriveEvent } from "../events/bus.js";
+import {
+  COMMENT_MENTION_EVENT,
+  COMMENT_NOTIFICATION_EVENT,
+  addMentions,
+  emitCommentNotificationEvents,
+  emitMentionNotifications,
+  resolveMentions,
+  saveMentions,
+} from "./comment-mentions.js";
 
 // --- Event helper ---
 
@@ -48,6 +60,24 @@ function emitEvent(
     .run();
 }
 
+function publishCommentChange(
+  ctx: OpContext,
+  comment: { id: string; path: string; parentId?: string | null },
+  action: Extract<DriveEvent, { type: "comment.changed" }>["action"],
+  at: Date
+) {
+  publishDriveEvent({
+    type: "comment.changed",
+    driveId: ctx.driveId,
+    path: comment.path,
+    commentId: comment.id,
+    parentId: comment.parentId ?? null,
+    action,
+    actor: ctx.userId,
+    at: at.toISOString(),
+  });
+}
+
 function emitCommentNotifications(
   ctx: OpContext,
   params: { commentId: string; path: string; parentId?: string; createdAt: Date }
@@ -65,26 +95,13 @@ function emitCommentNotifications(
 
   if (recipients.length === 0) return;
 
-  ctx.db
-    .insert(schema.events)
-    .values(
-      recipients.map(({ userId }) => ({
-        id: crypto.randomUUID(),
-        orgId: ctx.orgId,
-        type: "comment_notification",
-        resourceType: "comment",
-        resourceId: params.commentId,
-        actor: ctx.userId,
-        target: userId,
-        status: "created" as const,
-        metadata: JSON.stringify({
-          path: params.path,
-          parentId: params.parentId,
-        }),
-        createdAt: params.createdAt,
-      }))
-    )
-    .run();
+  emitCommentNotificationEvents(ctx, {
+    eventType: COMMENT_NOTIFICATION_EVENT,
+    commentId: params.commentId,
+    userIds: recipients.map(({ userId }) => userId),
+    metadata: { path: params.path, parentId: params.parentId },
+    createdAt: params.createdAt,
+  });
 }
 
 // --- Helpers ---
@@ -110,6 +127,21 @@ function getScopedComment(ctx: OpContext, id: string) {
     .get();
 }
 
+// Quote anchors only need enough text to re-find the selection; cap what we
+// store rather than reject, so a long selection never fails comment-add.
+const QUOTE_EXACT_MAX = 4000;
+const QUOTE_CONTEXT_MAX = 64;
+
+function normalizeQuote(quote: CommentQuote | undefined): CommentQuote | undefined {
+  if (!quote || !quote.exact) return undefined;
+  return {
+    exact: quote.exact.slice(0, QUOTE_EXACT_MAX),
+    // Keep the context closest to the selection.
+    prefix: quote.prefix ? quote.prefix.slice(-QUOTE_CONTEXT_MAX) : undefined,
+    suffix: quote.suffix ? quote.suffix.slice(0, QUOTE_CONTEXT_MAX) : undefined,
+  };
+}
+
 function toCommentEntry(row: any): CommentEntry {
   return {
     id: row.id,
@@ -118,6 +150,13 @@ function toCommentEntry(row: any): CommentEntry {
     lineStart: row.lineStart ?? undefined,
     lineEnd: row.lineEnd ?? undefined,
     quotedContent: row.quotedContent ?? undefined,
+    quote: row.quoteExact
+      ? {
+          exact: row.quoteExact,
+          prefix: row.quotePrefix ?? undefined,
+          suffix: row.quoteSuffix ?? undefined,
+        }
+      : undefined,
     body: row.body,
     author: row.author,
     resolved: row.resolved ?? false,
@@ -130,7 +169,8 @@ function toCommentEntry(row: any): CommentEntry {
   };
 }
 
-// Only display names leave this lookup. Membership roles and emails remain private.
+// This lookup adds display names to comments. Member emails are available through
+// drive-members, while membership roles remain private to admin surfaces.
 function addAuthorNames<T extends { author: string; authorDisplayName?: string }>(ctx: OpContext, entries: T[]): T[] {
   const ids = [...new Set(entries.map((entry) => entry.author))];
   if (!ids.length) return entries;
@@ -138,6 +178,22 @@ function addAuthorNames<T extends { author: string; authorDisplayName?: string }
     .from(schema.users).where(inArray(schema.users.id, ids)).all();
   const names = new Map(users.map((user) => [user.id, user.displayName]));
   for (const entry of entries) entry.authorDisplayName = names.get(entry.author) ?? undefined;
+  return entries;
+}
+
+// Resolve fileVersionId (a file_versions row id) to its version number so
+// clients can diff the anchor version against the current one.
+function addFileVersions<T extends { fileVersionId?: number; fileVersion?: number }>(ctx: OpContext, entries: T[]): T[] {
+  const ids = [...new Set(entries.flatMap((entry) => entry.fileVersionId ?? []))];
+  if (!ids.length) return entries;
+  const rows = ctx.db.select({ id: schema.fileVersions.id, version: schema.fileVersions.version })
+    .from(schema.fileVersions)
+    .where(and(inArray(schema.fileVersions.id, ids), eq(schema.fileVersions.driveId, ctx.driveId)))
+    .all();
+  const versions = new Map(rows.map((row) => [row.id, row.version]));
+  for (const entry of entries) {
+    if (entry.fileVersionId !== undefined) entry.fileVersion = versions.get(entry.fileVersionId);
+  }
   return entries;
 }
 
@@ -179,6 +235,12 @@ export async function commentAdd(
       field: "path",
     });
   }
+  path = normalizePath(path);
+
+  const mentionUserIds = params.mentions
+    ? resolveMentions(ctx, params.mentions)
+    : [];
+  const quote = normalizeQuote(params.quote);
 
   // Capture current file version ID
   const currentVersion = ctx.db
@@ -190,43 +252,57 @@ export async function commentAdd(
         eq(schema.fileVersions.driveId, ctx.driveId)
       )
     )
-    .orderBy(desc(schema.fileVersions.id))
+    .orderBy(desc(schema.fileVersions.version))
     .limit(1)
     .get();
 
-  ctx.db
-    .insert(schema.comments)
-    .values({
-      id,
-      parentId: params.parentId ?? null,
-      orgId: ctx.orgId,
-      driveId: ctx.driveId,
-      path,
-      lineStart: params.lineStart ?? null,
-      lineEnd: params.lineEnd ?? null,
-      quotedContent: params.quotedContent ?? null,
-      fileVersionId: currentVersion?.id ?? null,
-      body: params.body,
-      author: ctx.userId,
-      resolved: false,
-      createdAt: now,
-      updatedAt: now,
-      isDeleted: false,
-    })
-    .run();
+  ctx.db.transaction((tx) => {
+    const txCtx = { ...ctx, db: tx as unknown as typeof ctx.db };
+    tx.insert(schema.comments)
+      .values({
+        id,
+        parentId: params.parentId ?? null,
+        orgId: ctx.orgId,
+        driveId: ctx.driveId,
+        path,
+        lineStart: params.lineStart ?? null,
+        lineEnd: params.lineEnd ?? null,
+        quotedContent: params.quotedContent ?? null,
+        quoteExact: quote?.exact ?? null,
+        quotePrefix: quote?.prefix ?? null,
+        quoteSuffix: quote?.suffix ?? null,
+        fileVersionId: currentVersion?.id ?? null,
+        body: params.body,
+        author: ctx.userId,
+        resolved: false,
+        createdAt: now,
+        updatedAt: now,
+        isDeleted: false,
+      })
+      .run();
 
-  emitEvent(ctx, {
-    type: "comment_created",
-    resourceType: "comment",
-    resourceId: id,
-    metadata: { path, parentId: params.parentId },
+    const newMentionUserIds = saveMentions(txCtx, id, mentionUserIds);
+    emitMentionNotifications(txCtx, {
+      commentId: id,
+      path,
+      parentId: params.parentId,
+      userIds: newMentionUserIds,
+      createdAt: now,
+    });
+    emitEvent(txCtx, {
+      type: "comment_created",
+      resourceType: "comment",
+      resourceId: id,
+      metadata: { path, parentId: params.parentId },
+    });
+    emitCommentNotifications(txCtx, {
+      commentId: id,
+      path,
+      parentId: params.parentId,
+      createdAt: now,
+    });
   });
-  emitCommentNotifications(ctx, {
-    commentId: id,
-    path,
-    parentId: params.parentId,
-    createdAt: now,
-  });
+  publishCommentChange(ctx, { id, path, parentId: params.parentId }, "created", now);
 
   return addAuthorNames(ctx, [{
     id,
@@ -235,6 +311,7 @@ export async function commentAdd(
     parentId: params.parentId,
     lineStart: params.lineStart,
     lineEnd: params.lineEnd,
+    quote,
     author: ctx.userId,
     createdAt: now,
   }])[0];
@@ -251,7 +328,22 @@ export async function commentList(
   ];
 
   if (params.path) {
-    conditions.push(eq(schema.comments.path, params.path));
+    conditions.push(eq(schema.comments.path, normalizePath(params.path)));
+  }
+
+  if (params.pathPrefix !== undefined) {
+    const prefix = normalizePrefix(params.pathPrefix);
+    if (prefix !== "/") {
+      const relativePrefix = prefix.slice(1);
+      // "0" is the BINARY-collation upper bound after a trailing "/".
+      const prefixUpper = prefix.slice(0, -1) + "0";
+      const relativePrefixUpper = relativePrefix.slice(0, -1) + "0";
+      conditions.push(sql`(
+        (${schema.comments.path} >= ${prefix} AND ${schema.comments.path} < ${prefixUpper})
+        OR
+        (${schema.comments.path} >= ${relativePrefix} AND ${schema.comments.path} < ${relativePrefixUpper})
+      )`);
+    }
   }
 
   if (params.parentId) {
@@ -305,7 +397,10 @@ export async function commentList(
     };
   });
 
-  addAuthorNames(ctx, comments.flatMap((comment) => [comment, ...comment.replies]));
+  const entries = comments.flatMap((comment) => [comment, ...comment.replies]);
+  addAuthorNames(ctx, entries);
+  addMentions(ctx, entries);
+  addFileVersions(ctx, comments);
   return { comments };
 }
 
@@ -357,7 +452,10 @@ export async function commentGet(
 
   const replies = replyRows.map((r) => toCommentEntry({ ...r, replyCount: 0 }));
 
-  addAuthorNames(ctx, [comment, ...replies]);
+  const entries = [comment, ...replies];
+  addAuthorNames(ctx, entries);
+  addMentions(ctx, entries);
+  addFileVersions(ctx, [comment]);
   return { comment, replies };
 }
 
@@ -379,19 +477,65 @@ export async function commentUpdate(
     });
   }
 
+  const mentionUserIds = params.mentions === undefined
+    ? undefined
+    : resolveMentions(ctx, params.mentions);
   const now = new Date();
-  ctx.db
-    .update(schema.comments)
-    .set({ body: params.body, updatedAt: now })
-    .where(
-      and(
-        eq(schema.comments.id, params.id),
-        eq(schema.comments.orgId, ctx.orgId),
-        eq(schema.comments.driveId, ctx.driveId)
+  ctx.db.transaction((tx) => {
+    const txCtx = { ...ctx, db: tx as unknown as typeof ctx.db };
+    tx.update(schema.comments)
+      .set({ body: params.body, updatedAt: now })
+      .where(
+        and(
+          eq(schema.comments.id, params.id),
+          eq(schema.comments.orgId, ctx.orgId),
+          eq(schema.comments.driveId, ctx.driveId)
+        )
       )
-    )
-    .run();
+      .run();
 
+    if (mentionUserIds !== undefined) {
+      const removeCondition = mentionUserIds.length > 0
+        ? and(
+            eq(schema.commentMentions.commentId, params.id),
+            notInArray(schema.commentMentions.userId, mentionUserIds)
+          )
+        : eq(schema.commentMentions.commentId, params.id);
+      const removedUserIds = tx.select({ userId: schema.commentMentions.userId })
+        .from(schema.commentMentions)
+        .where(removeCondition)
+        .all()
+        .map(({ userId }) => userId);
+      tx.delete(schema.commentMentions).where(removeCondition).run();
+
+      if (removedUserIds.length > 0) {
+        tx.update(schema.events)
+          .set({ status: "deleted" })
+          .where(
+            and(
+              eq(schema.events.orgId, txCtx.orgId),
+              eq(schema.events.type, COMMENT_MENTION_EVENT),
+              eq(schema.events.resourceType, "comment"),
+              eq(schema.events.resourceId, params.id),
+              inArray(schema.events.target, removedUserIds),
+              eq(schema.events.status, "created")
+            )
+          )
+          .run();
+      }
+
+      const newMentionUserIds = saveMentions(txCtx, params.id, mentionUserIds);
+      emitMentionNotifications(txCtx, {
+        commentId: params.id,
+        path: row.path,
+        parentId: row.parentId ?? undefined,
+        userIds: newMentionUserIds,
+        createdAt: now,
+      });
+    }
+  });
+
+  publishCommentChange(ctx, row, "updated", now);
   return { id: params.id, body: params.body, updatedAt: now };
 }
 
@@ -449,6 +593,7 @@ export async function commentDelete(
     resourceId: params.id,
   });
 
+  publishCommentChange(ctx, row, "deleted", now);
   return { deleted: true };
 }
 
@@ -496,6 +641,7 @@ export async function commentResolve(
     resourceType: "comment",
     resourceId: params.id,
   });
+  publishCommentChange(ctx, row, params.resolved ? "resolved" : "reopened", now);
 
   return {
     id: params.id,

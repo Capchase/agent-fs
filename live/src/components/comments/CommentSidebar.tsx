@@ -3,9 +3,19 @@ import { MessageSquarePlus, MessageCircle, ChevronDown, ChevronRight, PanelRight
 import { useAllComments } from "@/hooks/use-comments"
 import { useAuth } from "@/contexts/auth"
 import { sidePanelStore, useAddCommentPending } from "@/stores/side-panel"
+import { useCommentAnchorMap } from "@/stores/comment-anchors"
+import { setCommentSort, useCommentSort } from "@/stores/comment-sort"
+import { COMMENT_SORTS, isCommentSort, sortComments } from "@/lib/comment-sort"
 import { Button } from "@/components/ui/button"
 import { Kbd } from "@/components/ui/kbd"
 import { Spinner } from "@/components/ui/spinner"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Tooltip,
   TooltipContent,
@@ -14,19 +24,60 @@ import {
 import { CommentThread } from "./CommentThread"
 import { AddComment } from "./AddComment"
 
+function CommentSortMenu() {
+  const sort = useCommentSort()
+  const label = COMMENT_SORTS.find((s) => s.value === sort)?.label
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="xs"
+            className="gap-1 text-muted-foreground"
+            aria-label={`Sort comments: ${label}`}
+            title="Sort comments"
+          >
+            {label}
+            <ChevronDown />
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="w-32">
+        <DropdownMenuRadioGroup
+          value={sort}
+          onValueChange={(value) => { if (isCommentSort(value)) setCommentSort(value) }}
+        >
+          {COMMENT_SORTS.map((s) => (
+            <DropdownMenuRadioItem key={s.value} value={s.value} closeOnClick>
+              {s.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 interface CommentSidebarProps {
   path: string
+  isOpen?: boolean
   showHeader?: boolean
-  onCommentClick?: (lineStart?: number, lineEnd?: number, quotedContent?: string) => void
+  onCommentClick?: (lineStart?: number, lineEnd?: number, quotedContent?: string, commentId?: string) => void
   /** When provided, renders a collapse button in the header that calls this callback. */
   onCollapse?: () => void
 }
 
-export function CommentSidebar({ path, showHeader = true, onCommentClick, onCollapse }: CommentSidebarProps) {
+export function CommentSidebar({ path, isOpen = false, showHeader = true, onCommentClick, onCollapse }: CommentSidebarProps) {
   const { user } = useAuth()
-  const { unresolvedComments, resolvedComments, isLoading } = useAllComments(path)
+  const { unresolvedComments, resolvedComments, isLoading } = useAllComments(path, isOpen)
   const [showAddForm, setShowAddForm] = useState(false)
   const [showResolved, setShowResolved] = useState(false)
+  const sort = useCommentSort()
+  const anchors = useCommentAnchorMap()
+  // Open and resolved comments are sorted apart: resolved ones keep their own section.
+  const openSorted = sortComments(unresolvedComments, sort, anchors)
+  const resolvedSorted = sortComments(resolvedComments, sort, anchors)
 
   // The `n` shortcut requests the add-comment form via the side-panel store.
   // Consume it here (the sidebar owns the form's open state).
@@ -50,6 +101,7 @@ export function CommentSidebar({ path, showHeader = true, onCommentClick, onColl
             )}
           </span>
           <div className="flex items-center gap-0.5">
+            <CommentSortMenu />
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -91,6 +143,7 @@ export function CommentSidebar({ path, showHeader = true, onCommentClick, onColl
       )}
       {!showHeader && (
         <div className="flex justify-end gap-0.5 px-3 py-1 shrink-0">
+          <CommentSortMenu />
           <Tooltip>
             <TooltipTrigger
               render={
@@ -165,7 +218,7 @@ export function CommentSidebar({ path, showHeader = true, onCommentClick, onColl
           </div>
         ) : (
           <>
-            {unresolvedComments.map((comment) => (
+            {openSorted.map((comment) => (
               <CommentThread
                 key={comment.id}
                 comment={comment}
@@ -185,7 +238,7 @@ export function CommentSidebar({ path, showHeader = true, onCommentClick, onColl
                   {resolvedComments.length} resolved
                 </button>
                 {showResolved &&
-                  resolvedComments.map((comment) => (
+                  resolvedSorted.map((comment) => (
                     <CommentThread
                       key={comment.id}
                       comment={comment}

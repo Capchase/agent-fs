@@ -8,7 +8,7 @@ import type { OpContext } from "../ops/types.js";
 import { write } from "../ops/write.js";
 import { vecSearch as search } from "../ops/vec-search.js";
 import { OpenAIEmbeddingProvider } from "../search/embeddings/openai.js";
-import { indexFileEmbeddings } from "../search/pipeline.js";
+import { indexFileEmbeddings, readCurrentVersion } from "../search/pipeline.js";
 import { chunkContent } from "../search/chunker.js";
 
 // Skip entire file if required env vars are missing
@@ -66,17 +66,17 @@ afterAll(() => {
 });
 
 describe.skipIf(SKIP)("OpenAI Embedding Provider", () => {
-  test("embed returns 768-dim vector", async () => {
-    const vec = await provider.embed("Hello world, this is a test.");
+  test("embedQuery returns 768-dim vector", async () => {
+    const vec = await provider.embedQuery("Hello world, this is a test.");
     expect(vec.length).toBe(768);
     expect(typeof vec[0]).toBe("number");
   });
 
-  test("embedBatch returns multiple vectors", async () => {
-    const vecs = await provider.embedBatch([
+  test("embedDocuments returns multiple vectors", async () => {
+    const vecs = await provider.embedDocuments([
       "Authentication and login systems",
       "Database migration strategies",
-    ]);
+    ], { title: "test.md" });
     expect(vecs.length).toBe(2);
     expect(vecs[0].length).toBe(768);
     expect(vecs[1].length).toBe(768);
@@ -132,6 +132,7 @@ describe.skipIf(SKIP)("Full embedding pipeline + semantic search", () => {
         path,
         driveId: DRIVE_ID,
         content,
+        version: readCurrentVersion(db, { path, driveId: DRIVE_ID }) ?? null,
       });
     }
 

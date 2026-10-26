@@ -6,26 +6,40 @@ import {
   createVersion,
   assertExpectedVersion,
 } from "./versioning.js";
-import { indexFile, removeFromIndex } from "../search/fts.js";
+import { indexFile, indexedContent, removeFromIndex } from "../search/fts.js";
+import { readCurrentVersion } from "../search/pipeline.js";
 import { schema } from "../db/index.js";
-import { decodeIndexableText, detectMimeType } from "./mime.js";
+import { extractIndexableText, detectMimeType } from "./mime.js";
 import { clearSearchData } from "./search-index.js";
+import { invalidateDriveGlobListings } from "./glob-cache.js";
+import { normalizePath } from "./paths.js";
+import { ValidationError } from "../errors.js";
+import { favoritesAfterMove } from "./favorite.js";
+import { imageEligible, queueImageEmbeddings } from "../search/image-embedding.js";
+import { canRenderPdfPages } from "../search/pdf.js";
 
 export async function mv(
   ctx: OpContext,
   params: MvParams
 ): Promise<MvResult> {
-  const fromKey = getS3Key(ctx.orgId, ctx.driveId, params.from);
-  const toKey = getS3Key(ctx.orgId, ctx.driveId, params.to);
+  const from = normalizePath(params.from);
+  const to = normalizePath(params.to);
+  if (from === to) {
+    throw new ValidationError("Source and destination are the same path");
+  }
+  const pdfPageImages = await canRenderPdfPages(ctx.embeddingProvider);
+  const fromKey = getS3Key(ctx.orgId, ctx.driveId, from);
+  const toKey = getS3Key(ctx.orgId, ctx.driveId, to);
 
   // Optimistic concurrency: caller asserts the head of the *source* file.
   // If something else has bumped the source between read and mv, fail loudly.
   if (params.expectedVersion !== undefined) {
-    await assertExpectedVersion(ctx, params.from, params.expectedVersion);
+    await assertExpectedVersion(ctx, from, params.expectedVersion);
   }
 
   // 1. Copy to new location
   const copyResult = await ctx.s3.copyObject(fromKey, toKey);
+  invalidateDriveGlobListings(ctx.orgId, ctx.driveId);
 
   // 2. Get size from head
   const head = await ctx.s3.headObject(toKey);
@@ -34,49 +48,68 @@ export async function mv(
   // existing search metadata should move with it.
   const obj = await ctx.s3.getObject(toKey);
   const contentHash = createHash("sha256").update(obj.body).digest("hex");
-  const contentType = head.contentType ?? obj.contentType ?? detectMimeType(params.to);
+  const contentType = head.contentType ?? obj.contentType ?? detectMimeType(to);
+  const preserveImages = imageEligible(ctx.embeddingProvider, contentType, pdfPageImages, ctx.driveId);
+  const sourceFile = ctx.db.select({
+    imageStatus: schema.files.imageEmbeddingStatus,
+    textStatus: schema.files.embeddingStatus,
+  }).from(schema.files).where(and(eq(schema.files.path, from), eq(schema.files.driveId, ctx.driveId))).get();
+  const pdfText = contentType === "application/pdf"
+    ? indexedContent(ctx.db, { path: from, driveId: ctx.driveId })
+    : null;
 
   // 3. Create version on new path
   const version = await createVersion(ctx, {
-    path: params.to,
+    path: to,
     s3VersionId: copyResult.versionId ?? "",
     operation: "write",
-    message: params.message ?? `Moved from ${params.from}`,
+    message: params.message ?? `Moved from ${from}`,
     size: head.size,
     etag: copyResult.etag,
     contentType,
     contentHash,
   });
+  const targetVersion = readCurrentVersion(ctx.db, { path: to, driveId: ctx.driveId });
 
   // 4. Delete original
   await ctx.s3.deleteObject(fromKey);
 
   // 5. Mark old path as deleted
   await createVersion(ctx, {
-    path: params.from,
+    path: from,
     s3VersionId: "",
     operation: "delete",
-    message: `Moved to ${params.to}`,
+    message: `Moved to ${to}`,
   });
 
-  removeFromIndex(ctx.db, { path: params.from, driveId: ctx.driveId });
-  const content = decodeIndexableText(obj.body, contentType);
-  if (content === null) {
-    clearSearchData(ctx, params.to);
+  removeFromIndex(ctx.db, { path: from, driveId: ctx.driveId });
+  const preserveText = contentType === "application/pdf" || preserveImages;
+  const extracted = preserveText ? null : await extractIndexableText(obj.body, contentType);
+  if (readCurrentVersion(ctx.db, { path: to, driveId: ctx.driveId }) === targetVersion) {
+    clearSearchData(ctx, to, "all");
+    if (!preserveImages) clearSearchData(ctx, from, "image");
+    const content = preserveText ? pdfText : extracted?.text;
+    if (content !== null && content !== undefined) {
+      indexFile(ctx.db, { path: to, driveId: ctx.driveId, content });
+    }
+    if (preserveText || extracted !== null) {
+      // Move chunks in place so their vectors keep the same IDs.
+      ctx.db.update(schema.contentChunks).set({ filePath: to })
+        .where(and(eq(schema.contentChunks.filePath, from), eq(schema.contentChunks.driveId, ctx.driveId))).run();
+    } else {
+      clearSearchData(ctx, from, "text");
+    }
+    ctx.db.update(schema.files).set({
+      imageEmbeddingStatus: preserveImages ? sourceFile?.imageStatus ?? null : null,
+      embeddingStatus: preserveText || extracted !== null ? sourceFile?.textStatus ?? null : null,
+    }).where(and(eq(schema.files.path, to), eq(schema.files.driveId, ctx.driveId))).run();
+    if (preserveImages && sourceFile?.imageStatus === "pending") queueImageEmbeddings(ctx);
   } else {
-    indexFile(ctx.db, { path: params.to, driveId: ctx.driveId, content });
-    // Update chunk paths in-place (vectors stay the same).
-    ctx.db
-      .update(schema.contentChunks)
-      .set({ filePath: params.to })
-      .where(
-        and(
-          eq(schema.contentChunks.filePath, params.from),
-          eq(schema.contentChunks.driveId, ctx.driveId)
-        )
-      )
-      .run();
+    clearSearchData(ctx, from, "all");
   }
 
-  return { from: params.from, to: params.to, version };
+  // Stars follow the file.
+  await favoritesAfterMove(ctx, from, to);
+
+  return { from, to, version };
 }

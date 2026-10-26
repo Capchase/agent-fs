@@ -19,7 +19,10 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (this.embeddingContext) return;
     if (this.initPromise) return this.initPromise;
 
-    this.initPromise = this._doInit();
+    this.initPromise = this._doInit().catch((err) => {
+      this.initPromise = null;
+      throw err;
+    });
     return this.initPromise;
   }
 
@@ -38,16 +41,23 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     console.error("[agent-fs] Model ready:", modelPath);
 
     this.model = await this.llama.loadModel({ modelPath });
-    this.embeddingContext = await this.model.createEmbeddingContext();
+    // The model pools over the whole input, so a chunk must fit in one batch.
+    // node-llama-cpp defaults the batch to 512 tokens, and longer chunks came
+    // back with wrong vectors.
+    const size = this.model.trainContextSize;
+    this.embeddingContext = await this.model.createEmbeddingContext({
+      contextSize: size,
+      batchSize: size,
+    });
   }
 
-  async embed(text: string): Promise<number[]> {
+  async embedQuery(text: string): Promise<number[]> {
     await this.init();
     const result = await this.embeddingContext.getEmbeddingFor(text);
     return Array.from(result.vector);
   }
 
-  async embedBatch(texts: string[]): Promise<number[][]> {
+  async embedDocuments(texts: string[], _opts: { title: string }): Promise<number[][]> {
     await this.init();
     const results: number[][] = [];
     for (const text of texts) {

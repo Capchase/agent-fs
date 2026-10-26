@@ -126,6 +126,7 @@ describe("comment notifications", () => {
     expect(recipient.notifications).toEqual([
       expect.objectContaining({
         id: events[0].id,
+        kind: "comment",
         commentId: comment.id,
         path: "/docs/notification.md",
         body: "Please review this",
@@ -172,6 +173,33 @@ describe("comment notifications", () => {
       path: "/docs/thread.md",
       body: "Reply",
     });
+  });
+
+  test("includes the actor display name when the actor has one", async () => {
+    const { db, ctxA1, ctxB1 } = createFixture();
+    await commentAdd(ctxA1, { path: "/docs/unnamed.md", body: "Before" });
+    db.update(schema.users)
+      .set({ displayName: "Ada Lovelace" })
+      .where(eq(schema.users.id, USER_A))
+      .run();
+    await commentAdd(ctxA1, { path: "/docs/named.md", body: "After" });
+
+    const { notifications } = await commentNotificationList(ctxB1, {});
+    expect(notifications).toHaveLength(2);
+    // The name is resolved at read time, so older notifications pick it up too.
+    for (const notification of notifications) {
+      expect(notification).toMatchObject({
+        actor: USER_A,
+        actorDisplayName: "Ada Lovelace",
+      });
+    }
+
+    db.update(schema.users)
+      .set({ displayName: null })
+      .where(eq(schema.users.id, USER_A))
+      .run();
+    const unnamed = await commentNotificationList(ctxB1, {});
+    expect(unnamed.notifications[0].actorDisplayName).toBeUndefined();
   });
 
   test("marks selected or all active-drive notifications as read", async () => {

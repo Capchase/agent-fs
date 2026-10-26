@@ -2,9 +2,6 @@ import { beforeEach, describe, expect, test } from "bun:test"
 import {
   clearSearchFilter,
   fileSearchStore,
-  hasMatchingDescendant,
-  isPathMatched,
-  isPathVisible,
   setSearchError,
   setSearchLoading,
   setSearchResults,
@@ -14,7 +11,7 @@ describe("file search state", () => {
   beforeEach(() => clearSearchFilter())
 
   test("clears old matches while a new request runs", () => {
-    setSearchResults("report", "drive-a", ["docs/report.md"])
+    setSearchResults("report", "drive-a", ["docs/report.md"], 1)
     setSearchLoading("notes", "drive-a")
 
     expect(fileSearchStore.getSnapshot()).toEqual({
@@ -22,13 +19,13 @@ describe("file search state", () => {
       query: "notes",
       driveId: "drive-a",
       matchedPaths: [],
+      total: 0,
       error: null,
     })
-    expect(isPathVisible("docs/report.md")).toBe(false)
   })
 
   test("clears old matches when the active drive changes", () => {
-    setSearchResults("report", "drive-a", ["docs/report.md"])
+    setSearchResults("report", "drive-a", ["docs/report.md"], 1)
     setSearchLoading("report", "drive-b")
 
     expect(fileSearchStore.getSnapshot().driveId).toBe("drive-b")
@@ -40,18 +37,19 @@ describe("file search state", () => {
     expect(fileSearchStore.getSnapshot().status).toBe("error")
     expect(fileSearchStore.getSnapshot().error).toBe("Request failed")
 
-    setSearchResults("report", "drive-a", [])
+    setSearchResults("report", "drive-a", [], 0)
     expect(fileSearchStore.getSnapshot().status).toBe("success")
     expect(fileSearchStore.getSnapshot().error).toBeNull()
   })
 
+  test("keeps the server total past the result cap", () => {
+    setSearchResults("report", "drive-a", ["a/report.md", "b/report.md"], 120)
+    expect(fileSearchStore.getSnapshot().total).toBe(120)
+  })
+
   test("normalizes and deduplicates matches", () => {
-    setSearchResults("report", "drive-a", ["/docs/report.md", "docs/report.md/"])
+    setSearchResults("report", "drive-a", ["/docs/report.md", "docs/report.md/"], 1)
 
     expect(fileSearchStore.getSnapshot().matchedPaths).toEqual(["docs/report.md"])
-    expect(isPathMatched("/docs/report.md")).toBe(true)
-    expect(isPathMatched("docs/other.md")).toBe(false)
-    expect(isPathVisible("docs")).toBe(true)
-    expect(hasMatchingDescendant("docs")).toBe(true)
   })
 })

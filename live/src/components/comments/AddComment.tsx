@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useId, useRef, useState } from "react"
 import { Send } from "lucide-react"
 import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
@@ -8,6 +8,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { useAddComment } from "@/hooks/use-comments"
+import type { CommentQuote } from "@/api/types"
 
 interface AddCommentProps {
   path: string
@@ -15,6 +16,8 @@ interface AddCommentProps {
   lineStart?: number
   lineEnd?: number
   quotedContent?: string
+  /** Text-quote anchor ({ exact, prefix, suffix }) for robust re-anchoring. */
+  quote?: CommentQuote
   onDone?: () => void
   autoFocus?: boolean
   placeholder?: string
@@ -26,19 +29,29 @@ export function AddComment({
   lineStart,
   lineEnd,
   quotedContent,
+  quote,
   onDone,
   autoFocus,
   placeholder = "Add a comment...",
 }: AddCommentProps) {
   const [body, setBody] = useState("")
+  const [showEmptyHint, setShowEmptyHint] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const hintId = useId()
   const addComment = useAddComment()
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!body.trim()) return
+    if (addComment.isPending) return
+    // Keep Send clickable and explain the empty case instead of a dead button.
+    if (!body.trim()) {
+      setShowEmptyHint(true)
+      textareaRef.current?.focus()
+      return
+    }
 
     addComment.mutate(
-      { path, body: body.trim(), parentId, lineStart, lineEnd, quotedContent },
+      { path, body: body.trim(), parentId, lineStart, lineEnd, quotedContent, quote },
       {
         onSuccess: () => {
           setBody("")
@@ -65,8 +78,13 @@ export function AddComment({
       )}
       <div className="flex gap-2">
         <Textarea
+          ref={textareaRef}
           value={body}
-          onChange={(e) => setBody(e.target.value)}
+          onChange={(e) => {
+            setBody(e.target.value)
+            if (e.target.value.trim()) setShowEmptyHint(false)
+          }}
+          aria-describedby={showEmptyHint ? hintId : undefined}
           placeholder={placeholder}
           autoFocus={autoFocus}
           rows={2}
@@ -84,7 +102,7 @@ export function AddComment({
                 type="submit"
                 variant="ghost"
                 size="icon"
-                disabled={!body.trim() || addComment.isPending}
+                disabled={addComment.isPending}
                 className="self-end text-primary"
                 aria-label="Send comment"
               >
@@ -95,6 +113,11 @@ export function AddComment({
           <TooltipContent>Send (⌘⏎)</TooltipContent>
         </Tooltip>
       </div>
+      {showEmptyHint && (
+        <p id={hintId} role="status" className="text-xs text-muted-foreground">
+          Write a comment before sending.
+        </p>
+      )}
     </form>
   )
 }

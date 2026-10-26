@@ -1,7 +1,10 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback, useRef, type MutableRefObject } from "react"
 import { Maximize2, MessageSquare, Code, Eye, Copy, Link, Check, Download, Database, Pencil, Columns2, LayoutGrid, Type } from "lucide-react"
 import { useNavigate, useSearchParams } from "react-router"
+import { useQuery } from "@tanstack/react-query"
 import { isQueryablePath } from "@/lib/sql-engine/types"
+import { isHtmlPath, supportsHtmlSites } from "@/lib/html-view"
+import { healthQueryOptions } from "@/lib/upload-limit"
 import { useAuth } from "@/contexts/auth"
 import { useKeyboardShortcuts, type ShortcutMap } from "@/hooks/use-keyboard-shortcuts"
 import { useFileActions } from "@/hooks/use-file-actions"
@@ -11,16 +14,25 @@ import { uiChromeStore } from "@/stores/ui-chrome"
 import { sidePanelStore } from "@/stores/side-panel"
 import { toast } from "@/stores/toast"
 import { Kbd } from "@/components/ui/kbd"
+import { ShareButton } from "@/components/ShareDialog"
+import { FileFavoriteButton } from "@/components/FavoriteToggle"
+import { PresenceAvatars } from "@/components/presence/PresenceAvatars"
+import { usePresenceDoc } from "@/stores/presence"
 import type { ScrollToCommentCallback } from "@/pages/FileBrowser"
 import type { OutlineItem } from "@/lib/outline"
 import { useFileContent } from "@/hooks/use-file-content"
 import { useFileStat } from "@/hooks/use-file-stat"
 import { useComments } from "@/hooks/use-comments"
-import { TextViewer } from "./TextViewer"
+import { useSniffedAudioType } from "@/hooks/use-sniffed-audio-type"
+import { AUDIO_EXTS } from "@/lib/audio"
+// Lazy boundary: keeps Monaco out of the entry bundle (see LazyTextViewer).
+import { LazyTextViewer as TextViewer } from "./LazyTextViewer"
 import { MarkdownViewer } from "./MarkdownViewer"
 import { ImageViewer } from "./ImageViewer"
 import { VideoViewer } from "./VideoViewer"
+import { AudioViewer } from "./AudioViewer"
 import { PdfViewer } from "./PdfViewer"
+import { HtmlViewer } from "./HtmlViewer"
 import { FallbackViewer } from "./FallbackViewer"
 import { TablePreviewViewer } from "./TablePreviewViewer"
 import { DatabasePreviewViewer } from "./DatabasePreviewViewer"
@@ -52,8 +64,8 @@ const VIDEO_EXTS = new Set(["mp4", "webm", "ogv", "mov", "m4v"])
 // stored content-type is the generic `application/octet-stream`.
 const BINARY_EXTS = new Set([
   ...VIDEO_EXTS,
+  ...AUDIO_EXTS,
   "mkv", "avi", "wmv", "flv",
-  "mp3", "wav", "flac", "aac", "m4a", "ogg", "opus",
   "zip", "gz", "tar", "tgz", "bz2", "xz", "7z", "rar",
   "woff", "woff2", "ttf", "otf", "eot",
   "wasm", "bin", "exe", "dll", "so", "dylib", "o", "a",
@@ -95,6 +107,14 @@ function isVideo(path: string): boolean {
   return VIDEO_EXTS.has(getExt(path))
 }
 
+function isAudio(path: string, contentType?: string): boolean {
+  return AUDIO_EXTS.has(getExt(path)) || !!contentType?.startsWith("audio/")
+}
+
+function isGenericContentType(contentType?: string): boolean {
+  return !contentType || contentType === "application/octet-stream"
+}
+
 function isMarkdown(path: string): boolean {
   return ["md", "mdx", "txt"].includes(getExt(path))
 }
@@ -105,7 +125,7 @@ function isPdf(path: string): boolean {
 
 const TEXT_EXTS = new Set([
   "txt", "ts", "tsx", "js", "jsx", "json", "jsonl", "ndjson", "md", "mdx", "css", "scss",
-  "html", "xml", "yaml", "yml", "toml", "sh", "bash", "py", "rb", "rs",
+  "html", "htm", "xml", "yaml", "yml", "toml", "sh", "bash", "py", "rb", "rs",
   "go", "java", "c", "cpp", "h", "hpp", "sql", "graphql", "env", "cfg",
   "ini", "conf", "log", "csv", "tsv", "dockerfile", "makefile", "lock",
 ])
@@ -130,18 +150,26 @@ interface FileViewerProps {
 
 export function FileViewer({ path, className, showExpandButton = true, showHeader = true, onScrollToCommentRef, onOutlineChange }: FileViewerProps) {
   const navigate = useNavigate()
-  const { orgId, driveId } = useAuth()
+  const { client, orgId, driveId } = useAuth()
   const { data: stat, refetch: refetchStat } = useFileStat(path)
   const { data: commentsData } = useComments(path)
+  const { data: health } = useQuery(healthQueryOptions(client))
   const isImg = isImage(path)
   const isVid = isVideo(path)
+  const isAud = isAudio(path, stat?.contentType)
   const isMd = isMarkdown(path)
+  // Rendered in a sandboxed frame only when the server serves site shares;
+  // older servers keep showing the source.
+  const isHtml = isHtmlPath(path) && supportsHtmlSites(health)
   const commentCount = commentsData?.comments.length ?? 0
   const [showRaw, setShowRaw] = useState(false)
+  // Bumped on every save so the rendered HTML frame reloads.
+  const [saveCount, setSaveCount] = useState(0)
 
   // Editing state
   const [isEditing, setIsEditing] = useState(false)
   const [isDirty, setIsDirty] = useState(false)
+  usePresenceDoc(path, isEditing ? "edit" : "view")
   const { save, isSaving, error: saveError, clearError } = useFileSave(path)
 
   // Markdown edit layout (only in edit mode). The rich (MDXEditor) opt-in is
@@ -161,6 +189,8 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
     }
     setIsEditing(false)
     setMdEditView(defaultMdEditView)
+    // Each file opens rendered (markdown preview, HTML page, table grid).
+    setShowRaw(false)
   }, [path]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // `?edit=1` (set by the New file dialog) opens the file straight into edit
@@ -176,6 +206,10 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
     next.delete("edit")
     setSearchParams(next, { replace: true })
   }, [wantsEdit, path]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // `?page=N` (set by a search hit on a PDF page) opens the PDF at that page.
+  const pageParam = Number(searchParams.get("page"))
+  const pdfPage = Number.isInteger(pageParam) && pageParam > 0 ? pageParam : undefined
 
   const handleEnterEdit = useCallback(() => {
     setIsEditing(true)
@@ -208,8 +242,22 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
   // csv/tsv/ndjson in grid mode) need no raw-bytes fetch — the grid data comes
   // from the SQL engine. The raw fetch (presigned URL) is only used for text
   // and the optional "Source" toggle of tabular-text files.
+  // A file with an unknown extension and no type hint (e.g. chat audio saved
+  // without an extension) may be audio: its first bytes decide, before its
+  // bytes are decoded as text.
+  const ext = getExt(path)
+  const sniffAudio =
+    isGenericContentType(stat?.contentType) &&
+    !isImg && !isVid && !isAud && !isPdf(path) && !isTabBin && !isTabTxt && !isDb &&
+    !BINARY_EXTS.has(ext) && !TEXT_EXTS.has(ext)
+  const { data: sniffedAudio, isLoading: isSniffing } = useSniffedAudioType(
+    sniffAudio ? path : null,
+    stat?.currentVersion,
+  )
+
   const { data: content, isLoading, setContent } = useFileContent(
-    isImg || isVid || isPdf(path) || isTabBin || isDb || (isTabTxt && !showRaw)
+    isImg || isVid || isAud || isPdf(path) || isTabBin || isDb || (isTabTxt && !showRaw) ||
+      (sniffAudio && (isSniffing || !!sniffedAudio))
       ? null
       : path
   )
@@ -222,6 +270,7 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
       // Keep the cached text in step with the write so Cancel and the preview
       // show the saved content without a reload.
       setContent(path, text)
+      setSaveCount((n) => n + 1)
       refetchStat()
       return true
     } catch {
@@ -240,8 +289,9 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
 
   // File-scoped shortcuts: only live while a file is open, so they're naturally
   // context-scoped (can't collide with list/folder views). Same actions as the
-  // header buttons. The `e` source/preview toggle only exists for markdown
-  // (JSON's Format/Raw toggle is handled in TextViewer).
+  // header buttons. The `e` source/preview toggle only exists for markdown,
+  // tabular text and rendered HTML (JSON's Format/Raw toggle is handled in
+  // TextViewer).
   const fileActions = useFileActions(path)
   const fileShortcuts: ShortcutMap = {
     n: (e) => {
@@ -262,7 +312,7 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
       fileActions.download()
     },
   }
-  if (isMd || isTabTxt) {
+  if (isMd || isTabTxt || isHtml) {
     fileShortcuts.e = (e) => {
       e.preventDefault()
       setShowRaw((v) => !v)
@@ -370,16 +420,25 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
     )
   }
 
-  if (isPdf(path)) {
+  if (isAud || (sniffAudio && sniffedAudio)) {
     return (
       <div className={cn("flex flex-col h-full min-w-0", className)}>
         {showHeader && <ViewerHeader path={path} actions={fileActions} showExpand={showExpandButton} onExpand={() => navigate(`/detail/~/${orgId}/${driveId}/${path}`)} onQuery={onQuery} />}
-        <PdfViewer path={path} className="flex-1" />
+        <AudioViewer path={path} className="flex-1" />
       </div>
     )
   }
 
-  if (isLoading) {
+  if (isPdf(path)) {
+    return (
+      <div className={cn("flex flex-col h-full min-w-0", className)}>
+        {showHeader && <ViewerHeader path={path} actions={fileActions} showExpand={showExpandButton} onExpand={() => navigate(`/detail/~/${orgId}/${driveId}/${path}`)} onQuery={onQuery} />}
+        <PdfViewer path={path} page={pdfPage} className="flex-1" />
+      </div>
+    )
+  }
+
+  if (isLoading || (sniffAudio && isSniffing)) {
     return (
       <div className={cn("flex items-center justify-center h-full", className)}>
         <Spinner />
@@ -409,8 +468,8 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
     )
   }
 
-  // For markdown-like files: show raw/preview toggle in header.
-  const viewingRaw = isMd ? showRaw : true
+  // For markdown-like and HTML files: show raw/preview toggle in header.
+  const viewingRaw = isMd || isHtml ? showRaw : true
 
   // Determine what to show for markdown in edit mode
   const editingMarkdown = isEditing && isMd
@@ -425,7 +484,7 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
           onExpand={() => navigate(`/detail/~/${orgId}/${driveId}/${path}`)}
           onQuery={onQuery}
           commentCount={commentCount}
-          showViewToggle={isMd && !isEditing}
+          showViewToggle={(isMd || isHtml) && !isEditing}
           showRaw={showRaw}
           onToggleRaw={() => setShowRaw(!showRaw)}
           isEditable={textable}
@@ -479,6 +538,16 @@ export function FileViewer({ path, className, showExpandButton = true, showHeade
           comments={commentsData?.comments}
           className="flex-1 min-h-0"
           onScrollToCommentRef={onScrollToCommentRef}
+        />
+      ) : isHtml ? (
+        <HtmlViewer
+          // Per drive too: the drive-root confirm must not carry over to
+          // the same path in another drive.
+          key={`${orgId}/${driveId}/${path}`}
+          path={path}
+          className="flex-1 min-h-0"
+          reloadKey={saveCount}
+          onShowSource={() => setShowRaw(true)}
         />
       ) : (
         <MarkdownViewer
@@ -665,13 +734,17 @@ function ViewerHeader({ path, actions, showExpand, onExpand, onQuery, commentCou
   splitOrientation?: SplitOrientation
   onToggleOrientation?: () => void
 }) {
-  const { copyPath, copyLink, download, copiedPath, copiedLink, canShare } = actions
+  const { data: stat } = useFileStat(path)
+  const { copyPath, copyLink, download, copiedPath, copiedLink, canShare, canShareLink } = actions
   const filename = path.split("/").pop() ?? path
 
   return (
     <div className="flex h-10 items-center justify-between border-b border-border px-4 shrink-0">
       <div className="flex items-center gap-2 min-w-0">
         <span className="text-sm font-medium truncate">{filename}</span>
+        {stat?.embeddingStatus && (
+          <span className="text-xs text-muted-foreground shrink-0">Embedding: {stat.embeddingStatus}</span>
+        )}
         {commentCount > 0 && (
           <span className="flex items-center gap-1 text-xs text-muted-foreground shrink-0">
             <MessageSquare className="size-3" />
@@ -680,6 +753,7 @@ function ViewerHeader({ path, actions, showExpand, onExpand, onQuery, commentCou
         )}
       </div>
       <div className="flex items-center gap-1 shrink-0">
+        <PresenceAvatars path={path} />
         {/* Markdown edit layout toggle (only in edit mode) */}
         {mdEditView && onMdEditViewChange && (
           <>
@@ -768,6 +842,7 @@ function ViewerHeader({ path, actions, showExpand, onExpand, onQuery, commentCou
             <div className="w-px h-4 bg-border mx-0.5" />
           </>
         )}
+        <FileFavoriteButton path={path} />
         <Tooltip>
           <TooltipTrigger
             render={
@@ -802,6 +877,7 @@ function ViewerHeader({ path, actions, showExpand, onExpand, onQuery, commentCou
             <TooltipContent>Copy link <Kbd className="ml-1">⇧Y</Kbd></TooltipContent>
           </Tooltip>
         )}
+        {canShareLink && <ShareButton path={path} />}
         <Tooltip>
           <TooltipTrigger
             render={

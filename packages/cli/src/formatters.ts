@@ -192,6 +192,7 @@ function formatSearch(result: any): string {
     .map(
       (r: any) =>
         `${r.path} (score: ${typeof r.score === "number" ? r.score.toFixed(3) : r.score})` +
+        (r.page != null ? ` [page ${r.page}]` : "") +
         (r.author ? `  by ${r.author}` : "") +
         `\n  ${r.snippet}`
     )
@@ -207,6 +208,12 @@ function formatGlob(result: any): string {
     .join("\n");
 }
 
+function formatFind(result: any): string {
+  const out = formatGlob(result);
+  const shown = result.matches?.length ?? 0;
+  return result.total > shown ? `${out}\n(showing ${shown} of ${result.total}, use --limit for more)` : out;
+}
+
 function formatDiff(result: any): string {
   const changes: any[] = result.changes ?? [];
   if (changes.length === 0) return "(no changes)";
@@ -218,6 +225,39 @@ function formatDiff(result: any): string {
       return `${prefix} ${lineNum}${c.content}`;
     })
     .join("\n");
+}
+
+/**
+ * stderr warning for a diff whose versions were not compared line by line, or
+ * null when they were. An empty change list from the summary fallback looks
+ * exactly like two identical versions, so the CLI must say which it is.
+ */
+export function diffSourceWarning(result: any): string | null {
+  switch (result?.source) {
+    case "content":
+      return null;
+    case "summary":
+      return "warning: versions were not compared; changes come from the stored edit summary only (storage backend has no usable object versions)";
+    case "none":
+      return "warning: versions were not compared and no stored summary exists; empty changes do NOT mean the versions are identical (storage backend has no usable object versions)";
+    default:
+      // Older server without `source`: an empty result is ambiguous.
+      if ((result?.changes ?? []).length === 0) {
+        return "warning: server did not report whether the versions were compared; empty changes may mean they were not";
+      }
+      return null;
+  }
+}
+
+/**
+ * stderr lines for a write whose markdown links point at paths missing from
+ * the drive. The write itself succeeded; this only flags likely broken links.
+ */
+export function writeLinkWarnings(result: any): string[] {
+  if (!Array.isArray(result?.warnings)) return [];
+  return result.warnings.map(
+    (w: any) => `warning: link not found at write time: ${w.link} -> ${w.resolvedPath}`
+  );
 }
 
 function formatTail(result: any): string {
@@ -293,6 +333,63 @@ function formatSignedUrl(result: any): string {
   return out;
 }
 
+function formatShareCreate(result: any): string {
+  if (result.kind === "site") {
+    // Site shares (a folder) have no view limit, so there is no Views line.
+    let out = `Site: ${result.url}\n\nExpires: ${formatDate(result.expiresAt)} (${result.expiresIn}s)`;
+    out += `\nID:      ${result.id}  (revoke: agent-fs share-revoke ${result.id})`;
+    if (result.appUrl) out += `\nApp:     ${result.appUrl}`;
+    return out;
+  }
+  const views = result.maxViews === null || result.maxViews === undefined
+    ? "unlimited"
+    : result.maxViews === 1 ? "one-off (1 view)" : `up to ${result.maxViews}`;
+  let out = `${result.url}\n\nExpires: ${formatDate(result.expiresAt)} (${result.expiresIn}s)\nViews:   ${views}`;
+  out += `\nID:      ${result.id}  (revoke: agent-fs share-revoke ${result.id})`;
+  if (result.appUrl) out += `\nApp:     ${result.appUrl}`;
+  return out;
+}
+
+function formatShareRevoke(result: any): string {
+  return result.revoked === 0
+    ? "No active share links to revoke (already revoked)."
+    : `Revoked ${result.revoked} share link${result.revoked === 1 ? "" : "s"}.`;
+}
+
+function formatDriveMembers(result: any): string {
+  const members: any[] = result.members ?? [];
+  if (members.length === 0) return "(no members)";
+
+  const rows = members.map((member) => [
+    member.displayName ?? "-",
+    member.email,
+    member.userId,
+  ]);
+  const headers = ["DISPLAY NAME", "EMAIL", "USER ID"];
+  const widths = headers.map((header, index) =>
+    Math.max(header.length, ...rows.map((row) => String(row[index]).length))
+  );
+  return [headers, ...rows]
+    .map((row) => row.map((cell, index) => padRight(String(cell), widths[index])).join("  "))
+    .join("\n");
+}
+
+function formatFavoriteAdd(result: any): string {
+  return `Starred ${result.path}${result.kind === "directory" ? "/" : ""}`;
+}
+
+function formatFavoriteRemove(result: any): string {
+  return result.removed ? `Unstarred ${result.path}` : `${result.path} was not starred`;
+}
+
+function formatFavoriteList(result: any): string {
+  const favorites: any[] = result.favorites ?? [];
+  if (favorites.length === 0) return "(no favorites)";
+  return favorites
+    .map((f) => (f.kind === "directory" ? `${f.path}/` : f.path))
+    .join("\n");
+}
+
 // --- Formatter registry ---
 
 const formatters: Record<string, (result: any) => string> = {
@@ -312,6 +409,7 @@ const formatters: Record<string, (result: any) => string> = {
   search: formatSearch,
   "vec-search": formatSearch,
   glob: formatGlob,
+  find: formatFind,
   diff: formatDiff,
   tail: formatTail,
   revert: formatRevert,
@@ -319,6 +417,12 @@ const formatters: Record<string, (result: any) => string> = {
   reindex: formatReindex,
   sql: formatSql,
   "signed-url": formatSignedUrl,
+  "share-create": formatShareCreate,
+  "share-revoke": formatShareRevoke,
+  "drive-members": formatDriveMembers,
+  "favorite-add": formatFavoriteAdd,
+  "favorite-remove": formatFavoriteRemove,
+  "favorite-list": formatFavoriteList,
 };
 
 function formatResult(opName: string, result: any): string {

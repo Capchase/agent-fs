@@ -11,6 +11,7 @@ primary_region = 'ams'
 
 [env]
   AGENT_FS_HOME = '/data'
+  AGENT_FS_RATE_LIMIT = '12000'
   SERVER_HOST = '0.0.0.0'
   AGENT_FS_CLOUD = 'true'
 
@@ -36,9 +37,13 @@ primary_region = 'ams'
     method = 'GET'
     path = '/health'
 
+# Dedicated CPU: a shared-cpu-1x machine runs out of CPU budget on a large
+# index (a vector scan reads every stored vector), and Fly then fails its
+# health checks. Every merge to main redeploys with this size.
+# 4 GB: the EmbeddingGemma 2 text and vision models peak at about 2.3 GB.
 [[vm]]
-  size = 'shared-cpu-1x'
-  memory = '2gb'
+  size = 'performance-1x'
+  memory = '4gb'
   cpus = 1
 
 [[statics]]

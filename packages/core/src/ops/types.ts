@@ -10,6 +10,12 @@ export interface OpContext {
   userId: string;
   embeddingProvider?: EmbeddingProvider | null;
   appUrl?: string;
+  /**
+   * Public address of this API server (no trailing slash), used to build
+   * absolute `/share/:token` links. Unset when the caller has no way to know it
+   * (in-process/IPC callers); `share-create` then returns a host-relative link.
+   */
+  apiUrl?: string;
 }
 
 // --- Param types ---
@@ -54,6 +60,10 @@ export interface LsParams {
 }
 
 export interface StatParams {
+  path: string;
+}
+
+export interface RevealParams {
   path: string;
 }
 
@@ -116,6 +126,19 @@ export interface WriteResult {
   contentHash?: string;
   /** True when the write was a no-op because head already had identical content. */
   deduped?: boolean;
+  /**
+   * Markdown only, present only when non-empty: links and images whose target
+   * was not in the drive at write time. Non-fatal; the write succeeded.
+   */
+  warnings?: WriteLinkWarning[];
+}
+
+export interface WriteLinkWarning {
+  /** The link target exactly as written in the markdown. */
+  link: string;
+  /** Drive path the target resolves to, relative to the file's own folder. */
+  resolvedPath: string;
+  message: string;
 }
 
 export interface CatResult {
@@ -157,6 +180,25 @@ export interface StatResult {
   modifiedAt: Date;
   isDeleted: boolean;
   embeddingStatus?: string;
+  /**
+   * Storage ETag of the current bytes. Opaque: compare for equality only. It
+   * changes whenever the stored content does, even for a write that did not
+   * bump `currentVersion`, so clients can use it to validate a cached copy.
+   * Absent when the storage backend does not report one.
+   */
+  etag?: string;
+}
+
+export interface RevealListing {
+  /** Directory path, root first: "/", "/a", "/a/b". */
+  path: string;
+  entries: LsEntry[];
+}
+
+export interface RevealResult {
+  path: string;
+  stat: StatResult;
+  listings: RevealListing[];
 }
 
 export interface RmResult {
@@ -194,10 +236,25 @@ export interface DiffChange {
   type: "add" | "remove" | "context";
   content: string;
   lineNumber?: number;
+  /** 1-based line in v1 (set on "remove" and "context" when content was diffed). */
+  oldLine?: number;
+  /** 1-based line in v2 (set on "add" and "context" when content was diffed). */
+  newLine?: number;
 }
+
+/**
+ * Which path produced a DiffResult:
+ * - "content": both versions were fetched and compared line by line.
+ * - "summary": the versions were not compared; `changes` comes from the
+ *   stored edit summary of v2 (old/new snippet only).
+ * - "none": the versions were not compared and v2 has no usable summary, so
+ *   `changes` is empty. This is NOT evidence that the versions are identical.
+ */
+export type DiffSource = "content" | "summary" | "none";
 
 export interface DiffResult {
   changes: DiffChange[];
+  source: DiffSource;
 }
 
 export interface RevertResult {
@@ -215,13 +272,25 @@ export interface RecentResult {
 
 // --- Comment types ---
 
+/**
+ * Text-quote anchor: the exact selected text plus up to 32 chars of context on
+ * each side, used to re-find the selection after the file changes.
+ */
+export interface CommentQuote {
+  exact: string;
+  prefix?: string;
+  suffix?: string;
+}
+
 export interface CommentAddParams {
   path?: string;
   body: string;
   parentId?: string;
+  mentions?: string[];
   lineStart?: number;
   lineEnd?: number;
   quotedContent?: string;
+  quote?: CommentQuote;
 }
 
 export interface CommentAddResult {
@@ -231,6 +300,7 @@ export interface CommentAddResult {
   parentId?: string;
   lineStart?: number;
   lineEnd?: number;
+  quote?: CommentQuote;
   author: string;
   authorDisplayName?: string;
   createdAt: Date;
@@ -238,6 +308,7 @@ export interface CommentAddResult {
 
 export interface CommentListParams {
   path?: string;
+  pathPrefix?: string;
   parentId?: string;
   resolved?: boolean;
   orgId?: string;
@@ -252,13 +323,21 @@ export interface CommentEntry {
   lineStart?: number;
   lineEnd?: number;
   quotedContent?: string;
+  quote?: CommentQuote;
   body: string;
   author: string;
   authorDisplayName?: string;
+  mentions?: Array<{
+    userId: string;
+    displayName: string | null;
+    email: string;
+  }>;
   resolved: boolean;
   resolvedBy?: string;
   resolvedAt?: Date;
   fileVersionId?: number;
+  /** Version number of fileVersionId (the head version when the comment was made). */
+  fileVersion?: number;
   replyCount: number;
   createdAt: Date;
   updatedAt: Date;
@@ -284,6 +363,7 @@ export interface CommentGetResult {
 export interface CommentUpdateParams {
   id: string;
   body: string;
+  mentions?: string[];
 }
 
 export interface CommentUpdateResult {
@@ -314,6 +394,7 @@ export interface CommentResolveResult {
 
 export interface CommentNotificationListParams {
   unreadOnly?: boolean;
+  kinds?: Array<"comment" | "mention">;
   limit?: number;
   offset?: number;
 }
@@ -321,11 +402,13 @@ export interface CommentNotificationListParams {
 export interface CommentNotificationEntry {
   /** Notification event ID. */
   id: string;
+  kind: "comment" | "mention";
   commentId: string;
   parentId?: string;
   path: string;
   body: string;
   actor: string;
+  actorDisplayName?: string;
   createdAt: Date;
   read: boolean;
 }
@@ -338,12 +421,61 @@ export interface CommentNotificationListResult {
 export interface CommentNotificationReadParams {
   /** Mark only these notification event IDs as read. */
   ids?: string[];
-  /** Mark every unread comment notification in the active drive as read. */
+  /** Mark every unread notification of these kinds in the active drive as read. */
   all?: boolean;
+  /** Defaults to comment when all is true. Ignored for explicit IDs. */
+  kinds?: Array<"comment" | "mention">;
 }
 
 export interface CommentNotificationReadResult {
   markedRead: number;
+}
+
+// --- Drive member types ---
+
+export interface DriveMembersParams {}
+
+export interface DriveMember {
+  userId: string;
+  email: string;
+  displayName: string | null;
+}
+
+export interface DriveMembersResult {
+  members: DriveMember[];
+}
+
+// --- Favorite types ---
+
+export type FavoriteKind = "file" | "directory";
+
+export interface FavoriteAddParams {
+  path: string;
+}
+
+export interface FavoriteRemoveParams {
+  path: string;
+}
+
+export interface FavoriteListParams {}
+
+export interface Favorite {
+  path: string;
+  kind: FavoriteKind;
+  createdAt: string;
+}
+
+export interface FavoriteAddResult extends Favorite {
+  favorited: true;
+}
+
+export interface FavoriteRemoveResult {
+  path: string;
+  removed: boolean;
+}
+
+export interface FavoriteListResult {
+  favorites: Favorite[];
 }
 
 // --- Tree types ---
@@ -422,4 +554,27 @@ export interface GlobMatch {
 
 export interface GlobResult {
   matches: GlobMatch[];
+}
+
+// --- Find types ---
+
+export interface FindParams {
+  query: string;
+  path?: string;
+  limit?: number;
+}
+
+export interface FindMatch {
+  path: string;
+  size: number;
+  modifiedAt?: Date;
+  /** Match quality. Higher is better. Only comparable within one result. */
+  score: number;
+}
+
+export interface FindResult {
+  /** Best first, capped at `limit`. */
+  matches: FindMatch[];
+  /** Number of matching files before the `limit` cap. */
+  total: number;
 }

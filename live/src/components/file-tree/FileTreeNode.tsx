@@ -1,158 +1,68 @@
-import { useState } from "react"
-import { useQuery } from "@tanstack/react-query"
-import {
-  Folder,
-  FolderOpen,
-  ChevronRight,
-  ChevronDown,
-  ExternalLink,
-  Download,
-  Link as LinkIcon,
-  FolderOpen as OpenIcon,
-  FilePlus,
-  FolderPlus,
-  Pencil,
-  Trash2,
-} from "lucide-react"
+import { memo } from "react"
+import { Folder, FolderOpen, ChevronRight, ChevronDown, MoreHorizontal } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { useAuth } from "@/contexts/auth"
 import { useBrowser } from "@/contexts/browser"
-import {
-  useExpanded,
-  useToggleExpanded,
-  useFocusedPath,
-  useSetFocusedPath,
-} from "@/stores/tree-expansion"
-import {
-  isPathMatched,
-  isPathVisible,
-  hasMatchingDescendant,
-} from "@/stores/file-search"
-import { useFileSearch } from "@/hooks/use-file-search"
-import { toast } from "@/stores/toast"
+import { treeExpansionStore } from "@/stores/tree-expansion"
 import { MiddleEllipsis } from "@/lib/middle-ellipsis"
 import { isUuidLike, useUuidName } from "@/lib/uuid-resolver"
 import { glyphFor } from "@/lib/file-glyphs"
-import { downloadFile } from "@/lib/download"
-import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
-import {
-  ContextMenu,
-  ContextMenuTrigger,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuSeparator,
-} from "@/components/ui/context-menu"
-import { NewEntryDialog, type NewEntryKind } from "@/components/file-mutations/NewEntryDialog"
-import { RenameDialog } from "@/components/file-mutations/RenameDialog"
-import { DeleteDialog } from "@/components/file-mutations/DeleteDialog"
-import type { LsEntry, LsResult } from "@/api/types"
-
-type NodeDialog = NewEntryKind | "rename" | "delete"
+import { TooltipTrigger, type TooltipHandle } from "@/components/ui/tooltip"
+import { FavoriteToggle } from "@/components/FavoriteToggle"
+import { Button } from "@/components/ui/button"
+import { DropdownMenuTrigger, type DropdownMenuHandle } from "@/components/ui/dropdown-menu"
+import type { LsEntry } from "@/api/types"
+import type { TreeMenuTarget } from "./FileTreeContextMenu"
 
 interface FileTreeNodeProps {
   entry: LsEntry
-  path: string
+  /** Folder that contains `entry` ("" for the drive root). */
+  parentPath: string
+  fullPath: string
   depth: number
-  /**
-   * When true and no other tree row holds focus, this row is the roving
-   * tabindex anchor (i.e. tabIndex={0}). Used to make the tree initially
-   * tabbable from outside.
-   */
-  isDefaultFocus?: boolean
+  isDir: boolean
+  expanded: boolean
+  isSelected: boolean
+  /** Roving tabindex: FileTree picks the single row that is tabbable. */
+  tabIndex: 0 | -1
+  /** The tree's one shared tooltip; each row is a detached trigger for it. */
+  tooltip: TooltipHandle
+  favorited: boolean
+  /** Absent when the server has no favorites: the row shows no star. */
+  onToggleFavorite?: (path: string, isDir: boolean) => void
+  /** The tree's one row menu; the row's "..." button is a detached trigger for it. */
+  rowMenu: DropdownMenuHandle<TreeMenuTarget>
 }
 
-export function FileTreeNode({ entry, path, depth, isDefaultFocus = false }: FileTreeNodeProps) {
-  const { client, orgId, driveId } = useAuth()
-  const { selectedFile, selectFile } = useBrowser()
-  const fullPath = path ? `${path}/${entry.name}` : entry.name
-  const isDir = entry.type === "directory"
-  const selectedPath = selectedFile?.replace(/^\/+|\/+$/g, "") ?? null
-  const isSelected = selectedPath === fullPath
-  const userExpanded = useExpanded(fullPath)
-  const toggleExpanded = useToggleExpanded()
-  // When the in-tree search filter is active, hide nodes outside the match
-  // path and force-expand folders that contain matching descendants. Subscribe
-  // to the store so re-renders fire on every keystroke.
-  const filter = useFileSearch()
-  const filterActive = filter.status === "success" && filter.query.length > 0
-  // Keep the selected file and its ancestor chain visible even when an old
-  // in-tree search is still active (for example after opening a notification).
-  // This preserves the promise that every file open reveals itself in Tree.
-  const isOnSelectedPath =
-    selectedPath === fullPath || selectedPath?.startsWith(`${fullPath}/`) === true
-  const visible = isPathVisible(fullPath) || isOnSelectedPath
-  const isSelectedNonmatch = isSelected && filterActive && !isPathMatched(fullPath)
-  const expandedByFilter = filterActive && isDir && hasMatchingDescendant(fullPath)
-  const expanded = userExpanded || expandedByFilter
-  const focusedPath = useFocusedPath()
-  const setFocusedPath = useSetFocusedPath()
-  const isFocused = focusedPath === fullPath
-  // Roving tabindex: only one row in the tree is tabbable at a time.
-  const tabIndex = isFocused || (focusedPath === null && isDefaultFocus) ? 0 : -1
+/**
+ * One tree row. Children, the context menu, dialogs and the tooltip popup all
+ * live in FileTree, so a row only renders its own button and is skipped by
+ * React unless one of its props changes.
+ */
+export const FileTreeNode = memo(function FileTreeNode({
+  entry,
+  parentPath,
+  fullPath,
+  depth,
+  isDir,
+  expanded,
+  isSelected,
+  tabIndex,
+  tooltip,
+  favorited,
+  onToggleFavorite,
+  rowMenu,
+}: FileTreeNodeProps) {
+  const { selectFile } = useBrowser()
   const isUuidDir = isDir && isUuidLike(entry.name)
-  const resolvedUuidName = useUuidName(path, isUuidDir ? entry.name : "")
-  // Mutation dialogs opened from the context menu. Mounted only while open so
-  // a large tree does not carry a dialog per row.
-  const [dialog, setDialog] = useState<NodeDialog | null>(null)
-  const closeDialog = (open: boolean) => {
-    if (!open) setDialog(null)
-  }
-  // "New file" / "New folder" target the folder itself, or a file's parent.
-  const newEntryBase = isDir ? fullPath : path
-
-  const { data: children } = useQuery({
-    queryKey: ["ls", orgId, driveId, fullPath],
-    queryFn: () =>
-      client.callOp<LsResult>(orgId!, "ls", { path: fullPath }, driveId),
-    enabled: isDir && expanded && !!driveId,
-  })
+  const resolvedUuidName = useUuidName(parentPath, isUuidDir ? entry.name : "")
 
   const handleClick = () => {
     if (isDir) {
-      // While the filter is force-expanding this folder, treat the click as
-      // a no-op for expansion (the user can't really "collapse" a filter
-      // expansion); just move focus.
-      if (!expandedByFilter) toggleExpanded(fullPath)
+      treeExpansionStore.toggle(fullPath)
     } else {
       selectFile(fullPath)
     }
-    setFocusedPath(fullPath)
-  }
-
-  if (filterActive && !visible) return null
-
-  const deepLink =
-    orgId && driveId
-      ? `${window.location.origin}/file/~/${orgId}/${driveId}/${fullPath}`
-      : null
-
-  const handleOpen = () => {
-    if (isDir) {
-      toggleExpanded(fullPath)
-      if (!expanded) return
-    }
-    selectFile(fullPath)
-  }
-
-  const handleCopyLink = async () => {
-    if (!deepLink) return
-    try {
-      await navigator.clipboard.writeText(deepLink)
-      toast.success("Link copied")
-    } catch {
-      toast.error("Couldn't copy link")
-    }
-  }
-
-  const handleOpenInNewTab = () => {
-    if (!deepLink) return
-    window.open(deepLink, "_blank", "noopener,noreferrer")
-  }
-
-  const canDownload = !isDir && !!orgId && !!driveId
-  const handleDownload = () => {
-    if (!canDownload) return
-    void downloadFile(client, orgId!, driveId!, fullPath, entry.name)
+    treeExpansionStore.setFocusedPath(fullPath)
   }
 
   const glyph = !isDir ? glyphFor(fullPath) : null
@@ -178,149 +88,90 @@ export function FileTreeNode({ entry, path, depth, isDefaultFocus = false }: Fil
       ? `${resolvedUuidName} (${entry.name})`
       : entry.name
 
+  // The star and the "..." button are siblings of the row button, never inside
+  // it, so a click on them cannot open the file or toggle the folder. They
+  // stay out of the tab order (the tree uses a roving tabindex); keyboard
+  // users reach the same actions from the context menu or the file header.
   return (
-    <div>
-      <ContextMenu>
-        <ContextMenuTrigger
+    <div className="group/row relative">
+      <button
+        type="button"
+        data-tree-path={fullPath}
+        data-tree-is-dir={isDir ? "true" : "false"}
+        data-tree-expanded={expanded ? "true" : "false"}
+        tabIndex={tabIndex}
+        onClick={handleClick}
+        onFocus={() => treeExpansionStore.setFocusedPath(fullPath)}
+        className={cn(
+          "flex w-full items-center gap-1.5 rounded-sm px-2 py-1 text-left text-sm hover:bg-sidebar-accent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1",
+          isSelected &&
+            "bg-sidebar-accent text-sidebar-accent-foreground font-medium",
+          onToggleFavorite ? "pr-12" : "pr-7",
+        )}
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
+      >
+        {isDir ? (
+          <>
+            {expanded ? (
+              <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+            )}
+            {expanded ? (
+              <FolderOpen className="h-4 w-4 shrink-0 text-amber-500" />
+            ) : (
+              <Folder className="h-4 w-4 shrink-0 text-amber-500" />
+            )}
+          </>
+        ) : (
+          <>
+            <span className="w-3" />
+            {glyph ? (
+              <glyph.Icon className={cn("h-4 w-4 shrink-0", glyph.className)} />
+            ) : null}
+          </>
+        )}
+        <TooltipTrigger
+          handle={tooltip}
+          payload={tooltipText}
           render={
-            <button
-              type="button"
-              data-tree-path={fullPath}
-              data-tree-is-dir={isDir ? "true" : "false"}
-              data-tree-expanded={expanded ? "true" : "false"}
-              tabIndex={tabIndex}
-              onClick={handleClick}
-              onFocus={() => setFocusedPath(fullPath)}
-              className={cn(
-                "flex w-full items-center gap-1.5 rounded-sm px-2 py-1 text-left text-sm hover:bg-sidebar-accent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1",
-                isSelected &&
-                  "bg-sidebar-accent text-sidebar-accent-foreground font-medium",
-              )}
-              style={{ paddingLeft: `${depth * 12 + 8}px` }}
-            >
-              {isDir ? (
-                <>
-                  {expanded ? (
-                    <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-                  ) : (
-                    <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
-                  )}
-                  {expanded ? (
-                    <FolderOpen className="h-4 w-4 shrink-0 text-amber-500" />
-                  ) : (
-                    <Folder className="h-4 w-4 shrink-0 text-amber-500" />
-                  )}
-                </>
-              ) : (
-                <>
-                  <span className="w-3" />
-                  {glyph ? (
-                    <glyph.Icon className={cn("h-4 w-4 shrink-0", glyph.className)} />
-                  ) : null}
-                </>
-              )}
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <span className="flex min-w-0 flex-1 items-baseline">
-                      {labelNode}
-                      {isSelectedNonmatch && (
-                        <span className="ml-1.5 shrink-0 rounded bg-sidebar-accent px-1 py-0.5 text-[10px] font-normal text-muted-foreground">
-                          Open, not a match
-                        </span>
-                      )}
-                    </span>
-                  }
-                />
-                <TooltipContent side="right" align="center">
-                  {tooltipText}
-                </TooltipContent>
-              </Tooltip>
-            </button>
+            <span className="flex min-w-0 flex-1 items-baseline">
+              {labelNode}
+            </span>
           }
         />
-        <ContextMenuContent>
-          <ContextMenuItem onClick={handleOpen}>
-            <OpenIcon className="h-4 w-4" />
-            Open
-          </ContextMenuItem>
-          <ContextMenuItem onClick={handleCopyLink} disabled={!deepLink}>
-            <LinkIcon className="h-4 w-4" />
-            Copy link
-          </ContextMenuItem>
-          <ContextMenuItem onClick={handleDownload} disabled={!canDownload}>
-            <Download className="h-4 w-4" />
-            Download
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem onClick={() => setDialog("file")} disabled={!driveId}>
-            <FilePlus className="h-4 w-4" />
-            New file…
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => setDialog("folder")} disabled={!driveId}>
-            <FolderPlus className="h-4 w-4" />
-            New folder…
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          {/* mv and rm are single-file ops; folders stay read-only here. */}
-          <ContextMenuItem onClick={() => setDialog("rename")} disabled={isDir || !driveId}>
-            <Pencil className="h-4 w-4" />
-            Rename…
-          </ContextMenuItem>
-          <ContextMenuItem
-            variant="destructive"
-            onClick={() => setDialog("delete")}
-            disabled={isDir || !driveId}
-          >
-            <Trash2 className="h-4 w-4" />
-            Delete…
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            onClick={handleOpenInNewTab}
-            disabled={!deepLink}
-          >
-            <ExternalLink className="h-4 w-4" />
-            Open in new tab
-          </ContextMenuItem>
-        </ContextMenuContent>
-      </ContextMenu>
-
-      {(dialog === "file" || dialog === "folder") && (
-        <NewEntryDialog kind={dialog} basePath={newEntryBase} open onOpenChange={closeDialog} />
-      )}
-      {dialog === "rename" && (
-        <RenameDialog path={fullPath} open onOpenChange={closeDialog} />
-      )}
-      {dialog === "delete" && (
-        <DeleteDialog path={fullPath} open onOpenChange={closeDialog} />
-      )}
-
-      {isDir && expanded && children && (
-        <div>
-          {children.entries
-            .sort((a, b) => {
-              if (a.type !== b.type) return a.type === "directory" ? -1 : 1
-              return a.name.localeCompare(b.name)
-            })
-            .map((child) => (
-              <FileTreeNode
-                key={child.name}
-                entry={child}
-                path={fullPath}
-                depth={depth + 1}
-              />
-            ))}
-          {children.entries.length === 0 && (
-            <p
-              className="px-2 py-1 text-xs text-muted-foreground italic"
-              style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}
-            >
-              Empty folder
-            </p>
+      </button>
+      {onToggleFavorite && (
+        <FavoriteToggle
+          favorited={favorited}
+          onToggle={() => onToggleFavorite(fullPath, isDir)}
+          name={entry.name}
+          tabIndex={-1}
+          className={cn(
+            "absolute right-6 top-1/2 size-5 -translate-y-1/2",
+            !favorited && "opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100",
           )}
-        </div>
+        />
       )}
+      <DropdownMenuTrigger
+        handle={rowMenu}
+        payload={{ path: fullPath, parentPath, name: entry.name, isDir }}
+        render={
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            tabIndex={-1}
+            aria-label={`More actions for ${entry.name}`}
+            title="More actions"
+            className={cn(
+              "absolute right-1 top-1/2 size-5 -translate-y-1/2 text-muted-foreground",
+              "opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100 data-[popup-open]:opacity-100 [@media(hover:none)]:opacity-100",
+            )}
+          />
+        }
+      >
+        <MoreHorizontal />
+      </DropdownMenuTrigger>
     </div>
   )
-}
+})
